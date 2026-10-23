@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 环境与运行时数据
+.env
+data/
+
+# 自然语言生成的策略代码（本地生成，不入库）
+backend/app/strategies/generated/
+
+# 前端
+node_modules/
+frontend/dist/
+
+# 编辑器
+.vscode/
+.idea/

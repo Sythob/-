@@ -1,0 +1,61 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background-color: var(--app-bg);
+  color: var(--app-text);
+}
+
+/* 主题变量随风格切换（默认深蓝商务） */
+:root {
+  --app-bg: #f5f7fa;
+  --app-card: #ffffff;
+  --app-text: #303133;
+  --app-text-secondary: #909399;
+  --app-border: #e4e7ed;
+  --sidebar-bg: #1d2b3a;
+  --sidebar-text: #c8d3e0;
+  --sidebar-active: #409eff;
+  --header-bg: #ffffff;
+}
+
+.el-card {
+  background-color: var(--app-card);
+  border-color: var(--app-border);
+}
+
+.el-card__header {
+  color: var(--app-text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 卡片头部右侧操作区（按钮组右对齐，替代 float:right） */
+.header-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 中国习惯：红涨绿跌 */
+.text-up {
+  color: #e03131;
+}
+
+.text-down {
+  color: #2f9e44;
+}
