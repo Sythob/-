@@ -6,7 +6,7 @@ __pycache__/
 
 # 环境与运行时数据
 .env
-data/
+/data/
 
 # 自然语言生成的策略代码（本地生成，不入库）
 backend/app/strategies/generated/
