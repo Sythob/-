@@ -289,7 +289,15 @@ onMounted(loadList)
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column prop="actual" label="实际情况" min-width="140" show-overflow-tooltip />
+            <el-table-column prop="actual" label="实际情况" min-width="130" show-overflow-tooltip />
+            <el-table-column label="错误归因" min-width="170" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span v-if="row.error_analysis" style="color: var(--app-text-secondary); font-size: 12px">
+                  {{ row.error_analysis }}
+                </span>
+                <span v-else-if="row.verdict === 'wrong' || row.verdict === 'partial'">--</span>
+              </template>
+            </el-table-column>
           </el-table>
           <el-empty v-if="!predRows.length" description="暂无预测记录（生成日报/周报后自动提取）" :image-size="60" />
           <div class="tip">预测从每期报告的「明日关注/下周预测」自动提取，次日自动核验对错；错误的教训自动沉淀进下次报告</div>

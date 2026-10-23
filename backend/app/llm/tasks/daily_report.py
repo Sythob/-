@@ -301,11 +301,17 @@ async def verify_pending_predictions(provider, latest_trade: str) -> tuple[str, 
                 row.verdict = verdict
                 row.actual = str(v.get("actual", ""))[:200]
                 row.lesson = str(v.get("lesson", ""))[:200]
+                row.error_analysis = str(v.get("basis_error", ""))[:200]
                 n += 1
                 mark = {"correct": "✅ 对", "wrong": "❌ 错", "partial": "⚠️ 部分对"}[verdict]
-                text_lines.append(f"{mark} [{r.horizon}/{r.category}] {r.content} —— 实际：{row.actual}")
-                if verdict in ("wrong", "partial") and row.lesson:
-                    wrong_lessons.append(row.lesson)
+                line = f"{mark} [{r.horizon}/{r.category}] {r.content} —— 实际：{row.actual}"
+                if verdict in ("wrong", "partial"):
+                    if row.error_analysis:
+                        line += f"\n  归因：{row.error_analysis}"
+                    if row.lesson:
+                        line += f"；改正：{row.lesson}"
+                        wrong_lessons.append(row.lesson)
+                text_lines.append(line)
             session.commit()
     if wrong_lessons:
         _save_lessons(wrong_lessons, latest_trade)

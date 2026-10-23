@@ -87,7 +87,10 @@ def test_weekly_report_generates_and_extracts(tmp_db):
 
 
 def test_weekly_skips_non_friday(tmp_db, monkeypatch):
-    """非周五收盘后拒绝生成（今天 2026-10-21 是周二）。"""
+    """非周五收盘后拒绝生成（固定用 2026-10-20 周二，与运行日无关）。"""
+    from app.data import calendar as calendar_module
+
+    monkeypatch.setattr(calendar_module, "latest_trade_date", lambda: "2026-10-20")
     result = asyncio.run(generate_weekly_report(provider=MockProvider()))
     assert result.get("skipped") is True
     assert "周五" in result.get("reason", "")

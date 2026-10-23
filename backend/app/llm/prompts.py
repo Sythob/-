@@ -129,12 +129,14 @@ PREDICT_EXTRACT_SYSTEM = """你是预测条目提取助手。从复盘报告中�
 无有效判断输出 {"predictions": []}。只输出 JSON。"""
 
 
-VERIFY_SYSTEM = """你是预测核验助手。给定待核验预测（按序号）与最新交易日实际行情，逐条判定对错，
+VERIFY_SYSTEM = """你是预测核验助手。给定待核验预测（按序号）与预测目标日的实际行情，逐条判定对错并做错误归因，
 输出 JSON：
 {"results": [{"index": 序号, "verdict": "correct"或"wrong"或"partial",
 "actual": "实际行情一句话（引用输入数据中的具体数字）",
+"basis_error": "该预测依据的错误所在（具体指出哪条数据被误读、哪个因素被忽略、或哪条逻辑不成立，不超过60字）；correct 时为空字符串",
 "lesson": "判定为 wrong/partial 时给出可复用的改正教训（不超过50字），correct 时为空字符串"}]}
 判定标准：方向与关键数值均命中=correct；方向对但关键数值偏差明显=partial；方向错=wrong。
+basis_error 必须对照该预测"依据"里引用的具体数据逐项检查，指出判断失误发生在哪条数据上。
 核验依据只能来自输入的实际行情数据，严禁编造。只输出 JSON。"""
 
 

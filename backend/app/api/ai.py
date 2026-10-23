@@ -76,6 +76,7 @@ def predictions(horizon: str = "", verdict: str = "", limit: int = 100):
                 {"id": r.id, "report_date": r.report_date, "horizon": r.horizon,
                  "category": r.category, "symbol": r.symbol, "content": r.content,
                  "verdict": r.verdict, "actual": r.actual, "lesson": r.lesson,
+                 "error_analysis": r.error_analysis,
                  "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")}
                 for r in rows
             ],
