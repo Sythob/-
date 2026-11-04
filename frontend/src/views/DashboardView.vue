@@ -5,6 +5,7 @@ import { computed, onMounted, ref } from 'vue'
 
 import request from '../api/request'
 import BaseChart from '../components/BaseChart.vue'
+import KlineChart, { type KBar } from '../components/KlineChart.vue'
 
 interface IndexQuote {
   symbol: string
@@ -15,23 +16,43 @@ interface IndexQuote {
   trade_date?: string
 }
 
-function sparklineOption(symbol: string): EChartsOption {
-  const history = indexHistories.value[symbol] || []
-  const values = history.map((h) => h.close)
-  const up = values.length >= 2 && values[values.length - 1] >= values[0]
-  return {
-    grid: { left: 0, right: 0, top: 2, bottom: 2 },
-    xAxis: { type: 'category', show: false, data: history.map((h) => h.date) },
-    yAxis: { type: 'value', show: false, scale: true },
-    series: [{
-      type: 'line', data: values, smooth: true, symbol: 'none',
-      lineStyle: { width: 1.5, color: up ? '#e03131' : '#2f9e44' },
-      areaStyle: { color: up ? 'rgba(224,49,49,0.08)' : 'rgba(47,158,68,0.08)' },
-    }],
-    tooltip: { show: false },
-    animation: false,
+// 指数走势大图：全局代码 → 本地日线库存储代码（上证指数存储为 sh000001）
+const INDEX_CHART_LIST = [
+  { symbol: 'sh000001', name: '上证指数', stored: 'sh000001' },
+  { symbol: 'sz399001', name: '深证成指', stored: '399001' },
+  { symbol: 'sz399006', name: '创业板指', stored: '399006' },
+  { symbol: 'sh000300', name: '沪深300', stored: '000300' },
+]
+const activeIndexSymbol = ref('sh000001')
+const indexBars = ref<Record<string, KBar[]>>({})
+const indexBarsLoading = ref(false)
+
+async function loadIndexBars(symbol: string) {
+  activeIndexSymbol.value = symbol
+  if (indexBars.value[symbol]) return
+  indexBarsLoading.value = true
+  try {
+    const stored = INDEX_CHART_LIST.find((i) => i.symbol === symbol)?.stored || symbol
+    indexBars.value[symbol] = (await request.get(`/market/bars/${stored}`, {
+      params: { adjust: 'raw', interval: 'daily' },
+      timeout: 60000,
+    })) as KBar[]
+  } catch {
+    indexBars.value[symbol] = []
+  } finally {
+    indexBarsLoading.value = false
   }
 }
+
+// 当前选中指数的实时行情条（来自指数卡片数据）
+const activeIndexQuote = computed<IndexQuote | null>(() => {
+  for (const g of indexGroups.value) {
+    for (const i of g.indices) {
+      if (i.symbol === activeIndexSymbol.value) return i
+    }
+  }
+  return null
+})
 
 interface IndexGroup {
   key: string
@@ -42,7 +63,6 @@ interface IndexGroup {
 }
 
 const indexGroups = ref<IndexGroup[]>([])
-const indexHistories = ref<Record<string, { date: string; close: number }[]>>({})
 const activeGroup = ref('a')
 const quotes = ref<Record<string, any>[]>([])
 const account = ref<Record<string, any> | null>(null)
@@ -59,7 +79,6 @@ async function loadAll() {
       histories: Record<string, { date: string; close: number }[]>
     }
     indexGroups.value = data.groups || []
-    indexHistories.value = data.histories || {}
     if (indexGroups.value.length && !indexGroups.value.some((g) => g.key === activeGroup.value)) {
       activeGroup.value = indexGroups.value[0].key
     }
@@ -106,6 +125,7 @@ async function ensureFresh() {
 
 onMounted(() => {
   loadAll()
+  loadIndexBars(activeIndexSymbol.value) // 指数走势大图（默认上证指数，失败时静默）
   ensureFresh()
 })
 
@@ -133,6 +153,45 @@ function fmtPct(v: number | undefined): string {
 
 <template>
   <el-card shadow="never" class="index-card">
+    <template #header>
+      指数走势
+      <el-radio-group
+        v-model="activeIndexSymbol"
+        size="small"
+        style="margin-left: 12px"
+        @change="(v: string | number | boolean | undefined) => loadIndexBars(String(v))"
+      >
+        <el-radio-button v-for="i in INDEX_CHART_LIST" :key="i.symbol" :value="i.symbol">
+          {{ i.name }}
+        </el-radio-button>
+      </el-radio-group>
+    </template>
+    <div v-if="activeIndexQuote" class="index-quote-bar">
+      <span class="index-quote-name">{{ activeIndexQuote.name }}</span>
+      <span class="index-quote-price" :class="(activeIndexQuote.pct_change || 0) >= 0 ? 'text-up' : 'text-down'">
+        {{ activeIndexQuote.last_price?.toFixed(2) }}
+      </span>
+      <span :class="(activeIndexQuote.pct_change || 0) >= 0 ? 'text-up' : 'text-down'">
+        <span v-if="activeIndexQuote.change !== undefined">{{ activeIndexQuote.change > 0 ? '+' : '' }}{{ activeIndexQuote.change?.toFixed(2) }}　</span>
+        {{ fmtPct(activeIndexQuote.pct_change) }}
+      </span>
+      <span v-if="activeIndexQuote.trade_date" class="index-quote-date">（{{ activeIndexQuote.trade_date }}）</span>
+    </div>
+    <div v-loading="indexBarsLoading" style="min-height: 120px">
+      <KlineChart
+        v-if="indexBars[activeIndexSymbol]?.length"
+        :bars="indexBars[activeIndexSymbol]!"
+        height="360px"
+      />
+      <el-empty
+        v-else-if="!indexBarsLoading"
+        description="暂无该指数 K 线数据（等系统同步后自动出现）"
+        :image-size="60"
+      />
+    </div>
+  </el-card>
+
+  <el-card shadow="never" class="index-card">
     <el-tabs v-model="activeGroup">
       <el-tab-pane v-for="g in indexGroups" :key="g.key" :label="g.name" :name="g.key">
         <el-row :gutter="12">
@@ -147,12 +206,6 @@ function fmtPct(v: number | undefined): string {
                 {{ fmtPct(idx.pct_change) }}
                 <span v-if="idx.trade_date" class="stat-date">（{{ idx.trade_date }}）</span>
               </div>
-              <BaseChart
-                v-if="indexHistories[idx.symbol]?.length"
-                :option="sparklineOption(idx.symbol)"
-                height="34px"
-                class="stat-spark"
-              />
             </div>
           </el-col>
         </el-row>
@@ -273,8 +326,27 @@ function fmtPct(v: number | undefined): string {
   font-size: 12px;
 }
 
-.stat-spark {
-  margin-top: 6px;
+.index-quote-bar {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.index-quote-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.index-quote-price {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.index-quote-date {
+  color: var(--app-text-secondary);
+  font-size: 12px;
 }
 
 .stat-note {

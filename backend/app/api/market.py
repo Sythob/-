@@ -85,13 +85,20 @@ def indices():
     from app.data.global_indices import get_grouped_indices
 
     result = get_grouped_indices()
+    # 全局指数代码 → 本地日线库存储代码（上证指数存储为 sh000001，避免与平安银行撞码）
+    stored_map = {
+        "sh000001": "sh000001", "sh000300": "000300",
+        "sz399001": "399001", "sz399006": "399006",
+    }
     # A股指数 30 日走势迷你图数据（本地日线库，仅已有历史的指数）
     histories: dict[str, list[dict]] = {}
     try:
         from app.data.loader import load_daily
 
         for index in result["groups"][0]["indices"]:
-            sym = index["symbol"].removeprefix("sh").removeprefix("sz")
+            sym = stored_map.get(index["symbol"])
+            if not sym:
+                continue
             df = load_daily(sym, adjust="raw").tail(30)
             if not df.empty:
                 histories[index["symbol"]] = [
@@ -232,7 +239,7 @@ def tscreen(limit: int = 20):
 
     state = market_regime()
     return {
-        "candidates": screen_tsymbols(limit=min(limit, 50), trend_strict=state["trend_strict"]),
+        "candidates": screen_tsymbols(limit=min(limit, 50)),  # 高要求：60日线强制向上
         "watch_zone": load_watch_zone(),
         "market_state": state,
     }

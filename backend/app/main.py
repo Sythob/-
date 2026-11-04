@@ -26,29 +26,19 @@ async def lifespan(_app: FastAPI):
 
     start_scheduler()
 
-    # 启动补齐：错过定时任务时自动同步今日数据 + 生成当日复盘（后台，不阻塞启动）
+    # 启动补齐：错过定时任务时自动修复（与「进入系统补跑」共用 catchup.run_catch_up）
     def _catch_up():
         try:
-            from app.data import calendar
-            from app.data.sync import ensure_fresh_data
+            from app.config import get_settings
 
-            if not calendar.is_trade_day():
-                return
-            result = ensure_fresh_data()
-            logger.info("启动补齐完成: %s", result["status"])
-            if result["status"] == "synced":
-                import asyncio
+            if not get_settings().startup_catchup:
+                return  # 测试环境关闭补跑
+            from app.scheduler.catchup import run_catch_up
 
-                from app.llm.tasks.daily_report import generate_daily_report
-                from app.llm.tasks.news_sentiment import score_news
-
-                try:
-                    asyncio.run(score_news(30))
-                except Exception:  # noqa: BLE001
-                    logger.exception("新闻情绪打分失败（不影响使用）")
-                asyncio.run(generate_daily_report())
+            run_catch_up(force=True)  # 启动补跑不受收盘时间限制（数据自愈优先）
         except Exception:  # noqa: BLE001
             logger.exception("启动补齐失败（不影响正常使用）")
+
 
     import threading
 

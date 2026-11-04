@@ -317,8 +317,14 @@ class AkshareSource(DataSource):
                     else:
                         df = _retry_call(_ak().stock_zh_a_daily, symbol=sina_symbol(symbol), adjust="")
                 except Exception as fallback_exc:
-                    logger.warning("新浪日线回退也失败 %s: %s", symbol, fallback_exc)
-                    raise fallback_exc
+                    logger.warning("新浪日线回退也失败 %s: %s，尝试 baostock 兜底", symbol, fallback_exc)
+                    try:
+                        from app.data.baostock_source import get_daily_bars as bs_daily
+
+                        return bs_daily(symbol, start=start, end=end)
+                    except Exception as bs_exc:  # noqa: BLE001
+                        logger.warning("baostock 兜底也失败 %s: %s", symbol, bs_exc)
+                        raise fallback_exc
                 out = _normalize_sina_daily(df, factor_map)
                 if start:
                     out = out[out["trade_date"] >= start]
@@ -351,18 +357,35 @@ class AkshareSource(DataSource):
                 return _normalize_hist(df, {})
             except Exception as exc:
                 logger.warning("东财指数日线失败，回退新浪源 %s: %s", symbol, exc)
-                df = _retry_call(_ak().stock_zh_index_daily, symbol=sina_index_symbol(symbol))
-                out = _normalize_sina_daily(df, {})
-                if start:
-                    out = out[out["trade_date"] >= start]
-                if end:
-                    out = out[out["trade_date"] <= end]
-                return out.reset_index(drop=True)
+                try:
+                    df = _retry_call(_ak().stock_zh_index_daily, symbol=sina_index_symbol(symbol))
+                    out = _normalize_sina_daily(df, {})
+                    if start:
+                        out = out[out["trade_date"] >= start]
+                    if end:
+                        out = out[out["trade_date"] <= end]
+                    return out.reset_index(drop=True)
+                except Exception as sina_exc:  # noqa: BLE001
+                    logger.warning("新浪指数日线失败，尝试 baostock 兜底 %s: %s", symbol, sina_exc)
+                    from app.data.baostock_source import get_daily_bars as bs_daily
+
+                    out = bs_daily(symbol, start=start, end=end)
+                    if start:
+                        out = out[out["trade_date"] >= start]
+                    if end:
+                        out = out[out["trade_date"] <= end]
+                    return out.reset_index(drop=True)
 
     def get_hour_bars(self, symbol: str) -> pd.DataFrame:
-        """60 分钟线（新浪源，仅保留近端数据，需每日积累）。"""
-        df = _retry_call(_ak().stock_zh_a_minute, symbol=sina_symbol(symbol), period="60")
-        return _normalize_minute(df)
+        """60 分钟线（新浪源，仅保留近端数据，需每日积累）；失败回退 baostock。"""
+        try:
+            df = _retry_call(_ak().stock_zh_a_minute, symbol=sina_symbol(symbol), period="60")
+            return _normalize_minute(df)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("新浪60分钟线失败，回退 baostock %s: %s", symbol, exc)
+            from app.data.baostock_source import get_hour_bars as bs_hour
+
+            return bs_hour(symbol)
 
     def get_today_minutes(self, symbol: str) -> pd.DataFrame:
         """最近交易日分时数据（1 分钟粒度，新浪源；周末/节假日显示上一交易日）。

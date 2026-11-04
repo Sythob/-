@@ -45,6 +45,27 @@ class MockProvider(LLMProvider):
         if schema_hint == "lessons":
             return {"lessons": ["模拟教训：预测回顾需要在真实数据下验证（未配置真实模型）"]}
 
+        if schema_hint == "second_opinion":
+            return {"opinion": "同意", "reason": "模拟复核（未配置真实模型）"}
+
+        if schema_hint == "board_reasons":
+            n = 0
+            for m in messages:
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    for line in content.splitlines():
+                        if line.strip() and line.strip()[0].isdigit():
+                            n += 1
+            return {"reasons": [
+                {"index": i + 1, "reason": "模拟原因：板块联动题材炒作（未配置真实模型）"}
+                for i in range(n)
+            ]}
+
+        if schema_hint == "position_risk":
+            return {"risk_level": "中", "score": 55,
+                    "factors": ["模拟风险因素：仓位集中度偏高（未配置真实模型）"],
+                    "suggestion": "模拟建议：控制仓位并设置止损（未配置真实模型）"}
+
         if schema_hint == "predictions":
             return {"predictions": [
                 {"category": "大盘", "symbol": "", "content": "模拟预测：指数明日维持震荡（未配置真实模型）"},

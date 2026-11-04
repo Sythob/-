@@ -78,3 +78,16 @@ def scheduler():
     from app.scheduler.jobs import scheduler_status
 
     return scheduler_status()
+
+
+@router.post("/system/onenter")
+def onenter():
+    """用户进入系统触发（收盘后）：立即拉数据并补生成当日日报等（后台运行）。
+
+    收盘前调用直接跳过（盘中数据不完整）；幂等，重复进入不会重复跑。
+    """
+    from app.scheduler.catchup import run_catch_up
+    from app.utils import tasks
+
+    task_id = tasks.submit(run_catch_up)
+    return {"task_id": task_id}

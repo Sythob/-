@@ -149,10 +149,13 @@ def _recent_turnover(symbol: str) -> float:
 
 
 def _save_board_watch(rows: list[dict]) -> int:
-    today = datetime.now().strftime("%Y-%m-%d")
+    from app.data import calendar
+
+    today = calendar.latest_trade_date()  # 数据日期 = 最新交易日
     with database.get_session() as session:
-        # 清理历史日期的旧候选，只保留当日（避免陈旧数据残留展示）
+        # 同日全量替换：清理所有旧行（含历史日期与同日旧轮次），保证展示 = 本次刷新结果
         session.query(BoardWatch).filter(BoardWatch.date != today).delete()
+        session.query(BoardWatch).filter(BoardWatch.date == today).delete()
         if not rows:
             session.commit()
             return 0
@@ -168,6 +171,8 @@ def _save_board_watch(rows: list[dict]) -> int:
             existing.amount = r["amount"]
             existing.score = r["score"]
             existing.risk = r["risk"]
+            existing.sector = r.get("sector", "")
+            existing.reason = r.get("reason", "")
             existing.date = today
         session.commit()
     return len(rows)
@@ -186,9 +191,69 @@ def load_board_watch() -> list[dict]:
         return [
             {"symbol": r.symbol, "name": r.name, "pct_change": r.pct_change,
              "streak": r.streak, "turnover": r.turnover, "amount": r.amount,
-             "score": r.score, "risk": r.risk, "date": r.date}
+             "score": r.score, "risk": r.risk, "sector": r.sector,
+             "reason": r.reason, "date": r.date}
             for r in rows
         ]
+
+
+async def _generate_rise_reasons(candidates: list[dict], sector_map: dict[str, str]) -> dict[str, str]:
+    """LLM 一次调用为全部候选生成上涨原因（含题材梗识别，如名字联动）。"""
+    from app.data.models import News
+    from app.llm.base import get_provider
+    from app.llm.prompts import BOARD_REASON_SYSTEM
+
+    if not candidates:
+        return {}
+    # 当日相关新闻（候选股票）
+    symbols = [c["symbol"] for c in candidates]
+    with database.get_session() as session:
+        news_rows = (
+            session.query(News)
+            .filter(News.symbol.in_(symbols))
+            .order_by(News.pub_time.desc()).limit(40).all()
+        )
+    news_map: dict[str, list] = {}
+    for n in news_rows:
+        news_map.setdefault(n.symbol, []).append(n.title[:40])
+    def _chunk_lines(chunk: list[dict]) -> str:
+        lines = []
+        for i, c in enumerate(chunk, 1):
+            news = "；".join(news_map.get(c["symbol"], [])[:2]) or "无"
+            lines.append(
+                f"{i}. {c['symbol']}（{c['name']}）{c['sector'] or '板块未知'} "
+                f"涨{c['pct_change']:.1f}% {c['streak']}连板 换手{c['turnover']:.1f}% "
+                f"额{c['amount'] / 1e8:.1f}亿 新闻：{news}"
+            )
+        return "今日涨停候选（请全部列出，禁止遗漏）：\n" + "\n".join(lines)
+
+    reasons = {}
+    try:
+        provider = get_provider()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("上涨原因生成失败: %s", exc)
+        return {}
+    # 分批（每批 15 只）：一次性输出 49 只原因会超过模型输出上限被截断
+    for start in range(0, len(candidates), 15):
+        chunk = candidates[start:start + 15]
+        try:
+            result = await provider.chat_json(
+                [{"role": "system", "content": BOARD_REASON_SYSTEM},
+                 {"role": "user", "content": _chunk_lines(chunk)}],
+                temperature=0.3, schema_hint="board_reasons",
+            )
+            items = result.get("reasons", [])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("上涨原因批次生成失败: %s", exc)
+            continue
+        for it in items:
+            try:
+                idx = int(it.get("index", 0)) - 1
+                if 0 <= idx < len(chunk):
+                    reasons[chunk[idx]["symbol"]] = str(it.get("reason", ""))[:110]
+            except (TypeError, ValueError):
+                continue
+    return reasons
 
 
 def refresh_board_screen(top_n: int = 30) -> dict:
@@ -234,9 +299,19 @@ def refresh_board_screen(top_n: int = 30) -> dict:
     ]
     if new_symbols:
         sync_watchlist_bars(new_symbols)
+    # 板块归属 + LLM 上涨原因
+    from app.data.market_extra import get_sector_map
+
+    sector_map = get_sector_map()
+    for c in candidates:
+        c["sector"] = sector_map.get(c["symbol"], "")
+    import asyncio
+
+    reasons = asyncio.run(_generate_rise_reasons(candidates, sector_map))
+    for c in candidates:
+        c["reason"] = reasons.get(c["symbol"], "")
     _save_board_watch(candidates)
-    logger.info("打板候选刷新完成：%d 个候选（换手率覆盖 %d/%d）",
-                len(candidates), sum(1 for c in candidates if c["turnover"] > 0), len(candidates))
+    logger.info("打板候选刷新完成：%d 个候选（换手率覆盖 %d/%d，原因覆盖 %d/%d）",
+                len(candidates), sum(1 for c in candidates if c["turnover"] > 0), len(candidates),
+                sum(1 for c in candidates if c["reason"]), len(candidates))
     return {"coarse": len(symbols), "candidates": len(candidates)}
-    return {"coarse": len(candidates), "candidates": candidates,
-            "synced": stats["updated"], "sync_failed": stats["failed"]}

@@ -124,8 +124,11 @@ LESSONS_SYSTEM = """你是量化复盘的经验提炼助手。根据今日复盘
 PREDICT_EXTRACT_SYSTEM = """你是预测条目提取助手。从复盘报告中提取「明日关注」/「下周预测」章节里的
 每一条方向明确、可验证的判断，输出 JSON：
 {"predictions": [{"category": "大盘"或"板块"或"个股", "symbol": "个股6位代码（大盘/板块为空字符串）",
-"content": "判断原文（含方向与依据，不超过80字）"}]}
+"content": "判断原文（含方向，不超过80字）",
+"basis": [{"metric": "依据指标名（如 换手率/成交量/RSI/涨停家数/两融余额）", "value": "具体数值（如 24.2%）",
+"note": "该依据如何支持判断（不超过30字）"}]}]}
 规则：只提取有明确方向（涨/跌/区间/目标价）的判断；模棱两可的不提取；
+basis 从判断的"依据"部分逐项提取（每项指标一条，最多 4 条，无依据则空数组）；
 无有效判断输出 {"predictions": []}。只输出 JSON。"""
 
 
@@ -138,6 +141,17 @@ VERIFY_SYSTEM = """你是预测核验助手。给定待核验预测（按序号�
 判定标准：方向与关键数值均命中=correct；方向对但关键数值偏差明显=partial；方向错=wrong。
 basis_error 必须对照该预测"依据"里引用的具体数据逐项检查，指出判断失误发生在哪条数据上。
 核验依据只能来自输入的实际行情数据，严禁编造。只输出 JSON。"""
+
+
+BOARD_REASON_SYSTEM = """你是打板题材分析师。给定当日涨停候选股列表（含名称/涨幅/连板/换手/板块/相关新闻），
+为每只股票生成一句上涨原因，输出 JSON：
+{"reasons": [{"index": 序号, "reason": "上涨原因一句话（不超过40字）"}]}
+要求：
+1. 优先识别题材联动：从全部候选的「名称」里发现共同特征（如名字含相同字、生肖/玄学梗、同一实控人、
+   同一事件受益方），这类题材要明确指出（如"羊字辈题材炒作，名字含羊联动"）
+2. 结合个股新闻（新闻标题里的事件驱动要写具体）；无新闻时根据板块/连板/换手给出常规原因
+   （如"军工板块异动""3连板高位博弈""次新股情绪炒作"）
+3. 禁止编造新闻和数字；每只都要有原因，不要空。只输出 JSON。"""
 
 
 WEEKLY_SYSTEM = """你是 A股每周复盘分析师。基于给定的本周市场数据、模拟账户操作记录与本周预测战绩，
@@ -174,11 +188,25 @@ def weekly_user_prompt(brief: str, date: str, prior_weekly: str = "",
 
 
 def report_user_prompt(market_brief: str, positions: str, news_summary: str, date: str,
-                       prior_report: str = "", lessons: str = "", verify_text: str = "") -> str:
+                       prior_report: str = "", lessons: str = "", verify_text: str = "",
+                       notes: str = "", basis_stats: str = "", sentiment_cycle: str = "",
+                       ml_signals: str = "", funds: str = "") -> str:
     parts = [f"日期：{date}"]
     parts.append(f"市场数据：\n{market_brief}")
     parts.append(f"模拟持仓：\n{positions or '无'}")
     parts.append(f"自选池新闻情绪摘要：\n{news_summary or '无'}")
+    if sentiment_cycle:
+        parts.append(f"短线情绪周期指标（生成「明日关注」时必须参考）：\n{sentiment_cycle}")
+    if ml_signals:
+        parts.append(f"ML 模型信号（AI+ML 双引擎，判断方向时参考）：\n{ml_signals}")
+    if funds:
+        parts.append(f"资金面证据（判断方向时参考）：\n{funds}")
+    if notes:
+        parts.append(f"用户当日交易笔记（在「持仓点评」中逐条对照点评：哪些想法被行情"
+                     f"验证、哪些判断失误，直接引用笔记原话）：\n{notes}")
+    if basis_stats:
+        parts.append(f"依据可信度统计（你历史预测各依据指标的准确率，生成「明日关注」时"
+                     f"必须优先使用准确率高的依据、避免使用标注为「慎用」的依据）：\n{basis_stats}")
     if lessons:
         parts.append(f"历史经验教训（此前复盘沉淀，撰写本期时参考）：\n{lessons}")
     if verify_text:

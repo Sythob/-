@@ -1,4 +1,6 @@
 """每日复盘报告：收集本地数据 → LLM 生成 Markdown → 存 ai_report 表。"""
+import asyncio
+import json
 from datetime import datetime
 
 from app.config import get_settings
@@ -72,9 +74,16 @@ def _build_market_brief() -> str:
     latest_trade = calendar_module.latest_trade_date()
     lines = _local_market_lines()
     try:
+        import concurrent.futures
+
         from app.data.sentiment import get_sentiment_overview
 
-        sentiment = get_sentiment_overview()
+        # 两融接口访问上交所官网可能很慢：线程 + 10 秒超时，防复盘被网络挂起卡死
+        pool = concurrent.futures.ThreadPoolExecutor(1)
+        try:
+            sentiment = pool.submit(get_sentiment_overview).result(timeout=10)
+        finally:
+            pool.shutdown(wait=False)
         if sentiment["breadth"]:
             b = sentiment["breadth"][0]
             if b["date"] == latest_trade:
@@ -96,6 +105,138 @@ def _build_positions_brief() -> str:
     from app.paper.account import positions_brief
 
     return positions_brief()
+
+
+def basis_stats(min_samples: int = 2) -> str:
+    """各依据指标的历史预测战绩统计（可信度排行，注入提示词修正预测行为）。"""
+    from app.data.models import AiPrediction
+
+    with database.get_session() as session:
+        rows = (
+            session.query(AiPrediction.basis_json, AiPrediction.verdict)
+            .filter(AiPrediction.verdict.in_(("correct", "wrong", "partial")))
+            .all()
+        )
+    stats: dict[str, list] = {}  # metric -> [n, score]
+    for raw, verdict in rows:
+        try:
+            basis = json.loads(raw or "[]")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        score = {"correct": 1.0, "partial": 0.5, "wrong": 0.0}[verdict]
+        for b in basis:
+            metric = str(b.get("metric", "")).strip()
+            if not metric:
+                continue
+            n, s = stats.get(metric, [0, 0.0])
+            stats[metric] = [n + 1, s + score]
+    if not stats:
+        return ""
+    lines = []
+    for metric, (n, s) in sorted(stats.items(), key=lambda x: -x[1][0]):
+        if n < min_samples:
+            continue
+        acc = s / n * 100
+        label = "可靠" if acc >= 60 else ("慎用" if acc < 40 else "中性")
+        lines.append(f"- {metric}：{n} 次预测，准确率 {acc:.0f}%（{label}）")
+    return "\n".join(lines)
+
+
+def _build_ml_signals() -> str:
+    """已训练 ML 模型对标的的明日上涨概率（AI+ML 双引擎参考）。"""
+    from app.data import calendar as calendar_module
+
+    lt = calendar_module.latest_trade_date()
+    lines = []
+    try:
+        from app.ml.features import build_features
+        from app.ml.persistence import list_models
+
+        models = {m["name"]: m for m in list_models()}
+        seen: set[str] = set()
+        for name, info in models.items():
+            try:
+                symbol = name.split("_")[1]
+            except IndexError:
+                continue
+            if symbol in seen:  # 同名旧模型跳过（保留最新）
+                continue
+            seen.add(symbol)
+            from app.ml.persistence import load_model_by_name
+
+            loaded = load_model_by_name(name)
+            if loaded is None:
+                continue
+            model, _row = loaded
+            df = loader.load_daily(symbol, adjust="qfq")
+            if df.empty or len(df) < 40:
+                continue
+            feats = build_features(df)
+            if feats.empty:
+                continue
+            proba_arr = model.predict_proba(feats.iloc[[-1]])
+            proba = float(proba_arr[0])  # predict_proba 已返回一维（正类概率）
+            lines.append(f"ML 模型（{name}）：{symbol} 明日上涨概率 {proba * 100:.0f}%"
+                         f"（截至 {lt}）")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ML 信号生成失败: %s", exc)
+        return ""
+    return "\n".join(lines)
+
+
+def _build_funds_brief() -> str:
+    """资金面证据：北向资金 + 龙虎榜（网络调用带超时保护）。"""
+    import concurrent.futures
+
+    def _fetch():
+        from app.data.market_extra import get_lhb, get_northbound
+
+        out = []
+        try:
+            nb = get_northbound()
+            for s in nb.get("summary", [])[:2]:
+                out.append(f"北向 {s['board']} 净买 {s['net'] / 1e8:+.1f} 亿（{s['date']}）")
+        except Exception as exc:  # noqa: BLE001
+            out.append(f"北向数据不可用（{type(exc).__name__}）")
+        try:
+            lhb = get_lhb()
+            tops = [r for r in lhb.get("rows", [])][:3]
+            if tops:
+                out.append("龙虎榜关注：" + "；".join(
+                    f"{r['name']} 涨跌 {r['change_pct']:+.1f}%({r['reason'][:12]})"
+                    for r in tops))
+        except Exception as exc:  # noqa: BLE001
+            out.append(f"龙虎榜数据不可用（{type(exc).__name__}）")
+        return "\n".join(out)
+
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    try:
+        return pool.submit(_fetch).result(timeout=15)
+    except Exception:  # noqa: BLE001
+        return ""
+    finally:
+        pool.shutdown(wait=False)
+
+
+def _build_notes_brief() -> str:
+    """当日交易笔记（每日主笔记 + 盘中随手记），供复盘对照用户思路。"""
+    from app.data import calendar as calendar_module
+    from app.data.models import TradingNote
+
+    date = calendar_module.latest_trade_date()
+    with database.get_session() as session:
+        rows = (
+            session.query(TradingNote)
+            .filter(TradingNote.date == date)
+            .order_by(TradingNote.id).all()
+        )
+    if not rows:
+        return ""
+    lines = []
+    for r in rows:
+        tag = "每日笔记" if r.kind == "daily" else "盘中记录"
+        lines.append(f"- [{tag}] {r.content}")
+    return "\n".join(lines)
 
 
 def _build_news_brief(limit: int = 20) -> str:
@@ -164,6 +305,55 @@ def _save_lessons(lessons: list[str], date: str) -> int:
 
 # ---------------------------------------------------------------- 预测台账
 
+async def _second_opinion_check(rows: list[dict], main_provider=None) -> int:
+    """双模型交叉验证：用与主模型不同的第二个模型对每条新预测表态同意/不同意。
+
+    规则：主模型为 DeepSeek/Claude/Qwen → 本地模型复核；主模型为本地 → 远程主力复核；
+    主模型为 mock（测试）→ mock 复核。复核模型不可用时静默跳过（不影响主流程）。
+    """
+    if not rows:
+        return 0
+    try:
+        name = getattr(main_provider, "name", "")
+        if name == "mock":
+            second = main_provider
+        elif name == "local":
+            from app.llm.base import get_provider
+
+            second = get_provider()
+        else:
+            from app.llm.local import LocalProvider
+
+            second = LocalProvider()
+    except Exception:  # noqa: BLE001
+        return 0
+    n = 0
+    for i, r in enumerate(rows):
+        try:
+            result = await asyncio.wait_for(second.chat_json(
+                [{"role": "system", "content":
+                  '你是预测复核员。对给定的预测表态，输出 JSON：{"opinion": "同意"或"不同意", '
+                  '"reason": "一句话理由（不超过40字）"}。只输出 JSON。'},
+                 {"role": "user", "content": f"预测：{r['content']}\n依据：{r.get('basis', [])}"}],
+                temperature=0.2, schema_hint="second_opinion",
+            ), timeout=60)
+            opinion = str(result.get("opinion", ""))
+            if opinion not in ("同意", "不同意"):
+                continue
+            from app.data.models import AiPrediction
+
+            with database.get_session() as session:
+                row = session.get(AiPrediction, r["id"])
+                if row is not None:
+                    row.second_opinion = opinion
+                    session.commit()
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("双模型复核失败（第 %d 条）: %s", i + 1, exc)
+            break  # 本地模型整体不可用 → 停止
+    return n
+
+
 async def extract_predictions(provider, content: str, report_date: str,
                               horizon: str = "daily") -> int:
     """从报告正文提取预测条目入台账（LLM 结构化提取，失败不影响报告）。"""
@@ -183,6 +373,7 @@ async def extract_predictions(provider, content: str, report_date: str,
         logger.warning("预测条目提取失败: %s", exc)
         return 0
     count = 0
+    created: list[dict] = []
     with database.get_session() as session:
         # 去重：同报告日期+周期重新提取时，先清掉旧条目（报告重新生成不产生重复台账）
         session.query(AiPrediction).filter(
@@ -196,19 +387,45 @@ async def extract_predictions(provider, content: str, report_date: str,
             category = str(item.get("category", "大盘"))
             if category not in ("大盘", "板块", "个股"):
                 category = "大盘"
+            basis = []
+            for b in item.get("basis", [])[:4]:
+                metric = str(b.get("metric", "")).strip()[:20]
+                if metric:
+                    basis.append({
+                        "metric": metric,
+                        "value": str(b.get("value", "")).strip()[:30],
+                        "note": str(b.get("note", "")).strip()[:60],
+                    })
             session.add(AiPrediction(
                 report_date=report_date, horizon=horizon, category=category,
                 symbol=str(item.get("symbol", "") or "")[:10],
                 content=content_text[:200], verdict="pending",
+                basis_json=json.dumps(basis, ensure_ascii=False),
             ))
+            session.flush()
+            created.append({"id": None, "content": content_text, "basis": basis})
             count += 1
         session.commit()
+    # 提交后重查新插入行的 id（供双模型复核回写）
+    if created:
+        from app.data.models import AiPrediction
+
+        with database.get_session() as session:
+            latest = (
+                session.query(AiPrediction)
+                .filter(AiPrediction.report_date == report_date,
+                        AiPrediction.horizon == horizon,
+                        AiPrediction.verdict == "pending")
+                .order_by(AiPrediction.id.desc()).limit(len(created)).all()
+            )
+            for meta, row in zip(reversed(created), reversed(latest)):
+                meta["id"] = row.id
     logger.info("预测台账入库 %d 条（%s %s）", count, horizon, report_date)
-    return count
+    return created
 
 
 def _next_trade_date(report_date: str) -> str:
-    """报告日期的下一个交易日（= 预测目标日）。"""
+    """报告日期的下一个交易日（= 日度预测目标日）。"""
     from datetime import timedelta
 
     from app.data import calendar as calendar_module
@@ -222,6 +439,24 @@ def _next_trade_date(report_date: str) -> str:
         return (datetime.strptime(report_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
     except ValueError:
         return ""
+
+
+def _target_date(report_date: str, horizon: str) -> str:
+    """预测目标日：日度 = 下一交易日；周度 = 报告周之后那一周的周五（周未结束不核验）。"""
+    from datetime import timedelta
+
+    from app.data import calendar as calendar_module
+
+    if horizon != "weekly":
+        return _next_trade_date(report_date)
+    try:
+        d = datetime.strptime(report_date, "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    friday_next_week = d + timedelta(days=(4 - d.weekday()) % 7 + 7)
+    dates = sorted(calendar_module.load_trade_dates())
+    candidates = [x for x in dates if x <= friday_next_week.strftime("%Y-%m-%d")]
+    return candidates[-1] if candidates else friday_next_week.strftime("%Y-%m-%d")
 
 
 def _market_lines_as_of(target: str) -> list[str]:
@@ -264,10 +499,10 @@ async def verify_pending_predictions(provider, latest_trade: str) -> tuple[str, 
         pending = [r for r in rows]
     if not pending:
         return "", 0
-    # 按预测目标日分组核验
+    # 按预测目标日分组核验（日度=次日；周度=目标周结束的周五，周未结束不核验）
     groups: dict[str, list] = {}
     for r in pending:
-        target = _next_trade_date(r.report_date)
+        target = _target_date(r.report_date, r.horizon)
         if target and target <= latest_trade:
             groups.setdefault(target, []).append(r)
     text_lines: list[str] = []
@@ -367,7 +602,16 @@ def _ensure_today_data() -> list[str]:
     missing = stale_symbols()
     if missing:
         logger.info("复盘数据校验：%d 只标的未更新到 %s，触发补同步", len(missing), latest_trade)
-        ensure_fresh_data()
+        # 补同步放线程执行 + 120 秒超时：网络挂起时绝不让任务无限等待
+        import concurrent.futures
+
+        pool = concurrent.futures.ThreadPoolExecutor(1)
+        try:
+            pool.submit(ensure_fresh_data).result(timeout=120)
+        except Exception:  # noqa: BLE001 超时/异常继续用现有数据
+            logger.warning("补同步超时/失败，按现有数据继续")
+        finally:
+            pool.shutdown(wait=False)
         missing = stale_symbols()
     return missing
 
@@ -413,6 +657,16 @@ async def generate_daily_report(provider=None, date: str | None = None) -> dict:
     market = _build_market_brief()
     positions = _build_positions_brief()
     news = _build_news_brief()
+    notes = _build_notes_brief()
+    cycle = ""
+    ml_signals = ""
+    funds = ""
+    if date is None:
+        from app.data.sentiment import sentiment_cycle_brief
+
+        cycle = sentiment_cycle_brief()
+        ml_signals = _build_ml_signals()
+        funds = _build_funds_brief()
     prior_report = _load_prior_report()
     lessons = _load_lessons()
 
@@ -430,6 +684,11 @@ async def generate_daily_report(provider=None, date: str | None = None) -> dict:
             prior_report=prior_report or "",
             lessons="\n".join(f"- {l}" for l in lessons),
             verify_text=verify_text,
+            notes=notes,
+            basis_stats=basis_stats(),
+            sentiment_cycle=cycle,
+            ml_signals=ml_signals,
+            funds=funds,
         )},
     ], temperature=0.5)
 
@@ -465,7 +724,10 @@ async def generate_daily_report(provider=None, date: str | None = None) -> dict:
         from app.utils.notify import send_notification
 
         # 预测台账：本期「明日关注」条目入库，供次日自动核验
-        n_pred = await extract_predictions(provider, content, report_date, horizon="daily")
+        pred_rows = await extract_predictions(provider, content, report_date, horizon="daily")
+        # 双模型交叉验证：本地模型（免费）对每条新预测表态同意/不同意
+        n_second = await _second_opinion_check(pred_rows, provider)
         send_notification("AI 复盘日报已生成", f"{row.title}（{provider.name}）\n内容见 Web 面板 AI 报告页。")
         return {"id": row.id, "title": row.title, "content_md": row.content_md,
-                "model": provider.name, "lessons": new_lessons, "predictions": n_pred}
+                "model": provider.name, "lessons": new_lessons,
+                "predictions": len(pred_rows), "second_opinions": n_second}

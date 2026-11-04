@@ -171,6 +171,15 @@ class PaperEngine:
 
             symbols = set(get_settings().watchlist_symbols)
             symbols.update(self._portfolio.positions.keys())
+            # 未成交委托的标的也纳入行情拉取：否则非自选股下单永远拿不到报价、永远不撮合
+            with database.get_session() as session:
+                pending_syms = (
+                    session.query(PaperOrder.symbol)
+                    .filter(PaperOrder.account_id == self._account_id,
+                            PaperOrder.status == "submitted")
+                    .distinct().all()
+                )
+            symbols.update(row[0] for row in pending_syms)
             quotes = fetch_quotes(sorted(symbols))
             if not quotes:
                 return {"quotes": 0, "message": "行情获取失败，跳过本轮"}

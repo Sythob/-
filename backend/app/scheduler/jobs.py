@@ -6,6 +6,7 @@
 import asyncio
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -23,14 +24,29 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def _safe(name: str):
-    """任务包装：异常只记日志，不中断调度。"""
+    """任务包装：异常只记日志，不中断调度；线程超时保护防网络挂起占死执行器。
+
+    线程无法被强杀：超时后线程在后台继续，但执行器 worker 立即释放，
+    后续任务照常触发——这是调度器不再"整体沉默"的关键。
+    """
 
     def decorator(fn):
         def wrapper():
+            def _run():
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001
+                    logger.exception("定时任务失败: %s", name)
+
+            import concurrent.futures
+
+            pool = concurrent.futures.ThreadPoolExecutor(1)
             try:
-                fn()
-            except Exception:  # noqa: BLE001
-                logger.exception("定时任务失败: %s", name)
+                pool.submit(_run).result(timeout=1800)  # 30 分钟上限
+            except concurrent.futures.TimeoutError:
+                logger.warning("定时任务超时（30 分钟上限）: %s", name)
+            finally:
+                pool.shutdown(wait=False)
 
         wrapper.__name__ = name
         return wrapper
@@ -43,6 +59,14 @@ def _safe(name: str):
 @_safe("sync_instruments")
 def job_sync_instruments():
     sync_instruments(full=True)  # 全市场名单（约 10 秒），支撑按名称搜索
+
+
+@_safe("sync_sector_membership")
+def job_sync_sector_membership():
+    """每周重建股票→行业板块映射（供打板候选/分析标注板块）。"""
+    from app.data.market_extra import sync_sector_membership
+
+    sync_sector_membership()
 
 
 @_safe("sync_watchlist_bars")
@@ -125,9 +149,10 @@ def job_daily_report():
 
 @_safe("news_forecast")
 def job_news_forecast():
-    """收盘后生成新闻热点明日行情预测。"""
-    if not calendar.is_trade_day():
-        return
+    """生成新闻热点行情预测（预测目标=下一交易日）。
+
+    交易日 17:45 预测次日；周末 10:00 聚合周末新闻预测周一（周日版本替换周六版本）。
+    """
     from app.llm.tasks.news_forecast import generate_news_forecast
 
     asyncio.run(generate_news_forecast())
@@ -157,6 +182,43 @@ def job_weekly_report():
         logger.info("周报跳过: %s", result.get("reason"))
     else:
         logger.info("周报已生成: %s 预测 %d 条", result.get("title"), result.get("predictions", 0))
+
+
+@_safe("symbol_analysis")
+def job_symbol_analysis():
+    """收盘后自动为模拟持仓个股生成解读（幂等：当日已有则跳过）。"""
+    if not calendar.is_trade_day():
+        return
+    from app.paper import account as account_service
+    from app.llm.tasks.symbol_analysis import analyze_symbol
+
+    symbols = [p["symbol"] for p in account_service.account_summary()["positions"]]
+    if not symbols:
+        logger.info("无持仓，跳过个股解读")
+        return
+    for sym in symbols:
+        try:
+            result = asyncio.run(analyze_symbol(sym))
+            if not result.get("skipped"):
+                logger.info("个股解读完成: %s", sym)
+        except Exception as exc:  # noqa: BLE001 单只失败不影响其余
+            logger.warning("个股解读失败 %s: %s", sym, exc)
+
+
+@_safe("position_risk")
+def job_position_risk():
+    """收盘后自动分析全部持仓风险（落库，前端持仓表展示风险徽标）。"""
+    if not calendar.is_trade_day():
+        return
+    from app.paper import account as account_service
+    from app.llm.tasks.position_risk import analyze_position_risk
+
+    symbols = [p["symbol"] for p in account_service.account_summary()["positions"]]
+    for sym in symbols:
+        try:
+            asyncio.run(analyze_position_risk(sym))
+        except Exception as exc:  # noqa: BLE001 单只失败不影响其余
+            logger.warning("持仓风险分析失败 %s: %s", sym, exc)
 
 
 @_safe("freshness_watchdog")
@@ -210,40 +272,54 @@ def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
         return
-    _scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+    _scheduler = BackgroundScheduler(
+        timezone="Asia/Shanghai",
+        executors={"default": ThreadPoolExecutor(max_workers=20)},
+    )
+    _scheduler.add_job(job_sync_sector_membership, CronTrigger(day_of_week="mon", hour=6, minute=20),
+                       misfire_grace_time=3600, id="sync_sector_membership")
     _scheduler.add_job(job_sync_instruments, CronTrigger(day_of_week="mon", hour=6, minute=10),
-                       id="sync_instruments")
+                       misfire_grace_time=3600, id="sync_instruments")
     _scheduler.add_job(job_sync_watchlist_bars, CronTrigger(day_of_week="mon-fri", hour=8, minute=30),
-                       id="sync_watchlist_morning")
+                       misfire_grace_time=3600, id="sync_watchlist_morning")
     _scheduler.add_job(job_sync_watchlist_bars, CronTrigger(day_of_week="mon-fri", hour=16, minute=5),
-                       id="sync_watchlist_close")
+                       misfire_grace_time=3600, id="sync_watchlist_close")
     _scheduler.add_job(job_sync_index_bars, CronTrigger(day_of_week="mon-fri", hour=16, minute=10),
-                       id="sync_index_bars")
+                       misfire_grace_time=3600, id="sync_index_bars")
     _scheduler.add_job(job_sync_breadth, CronTrigger(day_of_week="mon-fri", hour=16, minute=5),
-                       id="sync_breadth")
+                       misfire_grace_time=3600, id="sync_breadth")
     _scheduler.add_job(job_sync_hour_bars, CronTrigger(day_of_week="mon-fri", hour=16, minute=30),
-                       id="sync_hour_bars")
+                       misfire_grace_time=3600, id="sync_hour_bars")
     _scheduler.add_job(job_refresh_tscreen, CronTrigger(day_of_week="mon-fri", hour=16, minute=20),
-                       id="refresh_tscreen")
+                       misfire_grace_time=3600, id="refresh_tscreen")
     _scheduler.add_job(job_refresh_board_screen, CronTrigger(day_of_week="mon-fri", hour=16, minute=25),
-                       id="refresh_board_screen")
+                       misfire_grace_time=3600, id="refresh_board_screen")
     _scheduler.add_job(job_fetch_news, CronTrigger(day_of_week="mon-fri", hour=17, minute=0),
-                       id="fetch_news")
+                       misfire_grace_time=3600, id="fetch_news")
     _scheduler.add_job(job_news_sentiment, CronTrigger(day_of_week="mon-fri", hour=17, minute=30),
-                       id="news_sentiment")
+                       misfire_grace_time=3600, id="news_sentiment")
+    _scheduler.add_job(job_position_risk, CronTrigger(day_of_week="mon-fri", hour=17, minute=40),
+                       misfire_grace_time=3600, id="position_risk")
+    _scheduler.add_job(job_symbol_analysis, CronTrigger(day_of_week="mon-fri", hour=17, minute=35),
+                       misfire_grace_time=3600, id="symbol_analysis")
     _scheduler.add_job(job_daily_report, CronTrigger(day_of_week="mon-fri", hour=18, minute=0),
-                       id="daily_report")
+                       misfire_grace_time=3600, id="daily_report")
     _scheduler.add_job(job_weekly_report, CronTrigger(day_of_week="fri", hour=18, minute=30),
-                       id="weekly_report")
+                       misfire_grace_time=3600, id="weekly_report")
     _scheduler.add_job(job_news_forecast, CronTrigger(day_of_week="mon-fri", hour=17, minute=45),
-                       id="news_forecast")
-    _scheduler.add_job(job_paper_poll, IntervalTrigger(seconds=30), id="paper_quote_poll")
+                       misfire_grace_time=3600, id="news_forecast")
+    # 周末新闻 → 周一预测：周六/周日各更新一次（周日版本用更全新闻替换周六版本）
+    _scheduler.add_job(job_news_forecast, CronTrigger(day_of_week="sat", hour=10, minute=0),
+                       misfire_grace_time=3600, id="news_forecast_sat")
+    _scheduler.add_job(job_news_forecast, CronTrigger(day_of_week="sun", hour=10, minute=0),
+                       misfire_grace_time=3600, id="news_forecast_sun")
+    _scheduler.add_job(job_paper_poll, IntervalTrigger(seconds=30), misfire_grace_time=3600, id="paper_quote_poll")
     _scheduler.add_job(job_paper_settle, CronTrigger(day_of_week="mon-fri", hour=15, minute=5),
-                       id="paper_settle")
+                       misfire_grace_time=3600, id="paper_settle")
     _scheduler.add_job(job_ml_auto_retrain, CronTrigger(day_of_week="sun", hour=2, minute=17),
-                       id="ml_auto_retrain")
+                       misfire_grace_time=3600, id="ml_auto_retrain")
     _scheduler.add_job(job_freshness_watchdog, IntervalTrigger(minutes=30),
-                       id="freshness_watchdog")
+                       misfire_grace_time=3600, id="freshness_watchdog")
     _scheduler.start()
     logger.info("调度器已启动：%d 个任务", len(_scheduler.get_jobs()))
 

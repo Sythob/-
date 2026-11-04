@@ -9,7 +9,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from app.data import database
+from app.data import calendar, database
 from app.data.models import MarketBreadth
 from app.data.sync import get_source
 from app.utils.logger import get_logger
@@ -44,7 +44,8 @@ def sync_breadth() -> dict:
         logger.warning("广度同步失败（快照不可用）: %s", exc)
         return {"ok": False, "error": str(exc)[:80]}
     breadth = compute_breadth(quotes)
-    today = datetime.now().strftime("%Y-%m-%d")
+    # 数据日期 = 最新交易日（周末/节假日运行也不会写入错误日期）
+    today = calendar.latest_trade_date()
     with database.get_session() as session:
         row = session.get(MarketBreadth, today)
         if row is None:
@@ -58,6 +59,75 @@ def sync_breadth() -> dict:
         session.commit()
     logger.info("市场广度已入库: %s", breadth)
     return {"ok": True, **breadth}
+
+
+def sentiment_cycle_brief() -> str:
+    """短线情绪周期指标：涨停晋级率 / 炸板率 / 连板梯队 / 跌停趋势（纯本地库计算）。
+
+    这些是 A股短线预测最有效的领先指标，注入预测提示词提升准确率。
+    """
+    import threading
+    import time as _time
+
+    global _cycle_cache
+    with _cycle_lock:
+        if _cycle_cache[0] and _time.monotonic() - _cycle_cache[0] < 600:
+            return _cycle_cache[1]
+
+    from app.data import calendar
+    from app.data.models import BoardWatch, DailyBar, MarketBreadth
+    from app.data.board_screener import limit_threshold
+
+    lt = calendar.latest_trade_date()
+    lines = []
+    try:
+        with database.get_session() as session:
+            rows = (
+                session.query(DailyBar.symbol, DailyBar.close, DailyBar.high,
+                              DailyBar.pct_change)
+                .filter(DailyBar.trade_date == lt).all()
+            )
+            breadth = (
+                session.query(MarketBreadth)
+                .order_by(MarketBreadth.date.desc()).limit(2).all()
+            )
+            board = session.query(BoardWatch).filter(BoardWatch.date == lt).all()
+        touched = capped = 0
+        for symbol, close, high, pct in rows:
+            prev_close = close / (1 + pct / 100) if pct and pct > -99 else close
+            th = limit_threshold(symbol) / 100
+            limit_price = prev_close * (1 + th)
+            if high >= limit_price * 0.998:
+                touched += 1
+                if close >= limit_price * 0.998:
+                    capped += 1
+        blast_rate = (touched - capped) / touched * 100 if touched else 0.0
+        lines.append(f"今日触板 {touched} 只、封板 {capped} 只、炸板率 {blast_rate:.0f}%")
+        # 涨停晋级率：昨日涨停 → 今日连板
+        prev_limit = next((b.limit_up for b in breadth if b.date < lt), 0)
+        streak2 = sum(1 for b in board if b.streak >= 2)
+        promote = streak2 / prev_limit * 100 if prev_limit else 0.0
+        lines.append(f"涨停晋级率：昨日涨停 {prev_limit} 家 → 今日连板 {streak2} 家（{promote:.0f}%）")
+        # 连板梯队
+        t2 = sum(1 for b in board if b.streak == 2)
+        t3 = sum(1 for b in board if b.streak == 3)
+        t4 = sum(1 for b in board if b.streak >= 4)
+        lines.append(f"连板梯队：2板 {t2} / 3板 {t3} / 4板+ {t4}")
+        # 跌停趋势
+        cur_down = next((b.limit_down for b in breadth if b.date == lt), 0)
+        prev_down = next((b.limit_down for b in breadth if b.date < lt), 0)
+        lines.append(f"今日跌停 {cur_down} 家（昨日 {prev_down} 家）")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("情绪周期指标计算失败: %s", exc)
+        return ""
+    brief = "；".join(lines)
+    with _cycle_lock:
+        _cycle_cache = (_time.monotonic(), brief)
+    return brief
+
+
+_cycle_cache: tuple[float, str] = (0.0, "")
+_cycle_lock = threading.Lock()
 
 
 def latest_breadth() -> dict:
@@ -82,7 +152,7 @@ def get_margin_summary() -> dict:
     try:
         import akshare as ak
 
-        start = (datetime.now() - pd.Timedelta(days=30)).strftime("%Y%m%d")
+        start = (datetime.now() - pd.Timedelta(30, unit="D")).strftime("%Y%m%d")
         end = datetime.now().strftime("%Y%m%d")
         df = ak.stock_margin_sse(start_date=start, end_date=end)
         if df is None or df.empty:

@@ -80,8 +80,10 @@ def assistant_context() -> str:
 
 async def chat_with_assistant(message: str, history: list[dict] | None = None,
                               provider=None) -> dict:
-    """对话接口：注入数据快照 + 最近 10 条历史 → LLM 回复。"""
-    provider = provider or get_provider()
+    """对话接口：注入数据快照 + 最近 10 条历史 → LLM 回复。
+
+    默认用本地模型（Ollama，免费）；本地不可用时自动回退 DeepSeek。
+    """
     context = assistant_context()
     messages = [{"role": "system", "content": ASSISTANT_SYSTEM.format(context=context)}]
     for h in (history or [])[-10:]:
@@ -90,6 +92,18 @@ async def chat_with_assistant(message: str, history: list[dict] | None = None,
         if role in ("user", "assistant") and content:
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": message})
-    reply = await provider.chat(messages, temperature=0.5)
+    if provider is None:
+        from app.llm.local import LocalProvider
+
+        provider = LocalProvider()  # 助手默认：本地模型（免费）
+    try:
+        reply = await provider.chat(messages, temperature=0.5)
+    except Exception as exc:  # noqa: BLE001 本地不可用 → 回退主模型
+        fallback = get_provider()
+        if fallback.name == provider.name:
+            raise
+        logger.warning("助手本地模型不可用（%s），回退 %s", exc, fallback.name)
+        reply = await fallback.chat(messages, temperature=0.5)
+        provider = fallback
     logger.info("AI 助手对话: model=%s len=%d", provider.name, len(reply))
     return {"reply": reply, "model": provider.name}

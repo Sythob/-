@@ -178,6 +178,122 @@ def import_ths(positions_file: UploadFile | None = File(None),
     return {"positions_imported": n_pos, "trades_imported": n_trade, "warnings": warnings}
 
 
+@router.post("/paper/positions/{symbol}/risk")
+def analyze_risk(symbol: str):
+    """分析单只持仓风险（LLM 实时分析并落库，约 10~20 秒）。"""
+    import asyncio
+
+    from app.llm.tasks.position_risk import analyze_position_risk
+
+    try:
+        return asyncio.run(analyze_position_risk(symbol))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 不向前端泄露内部细节，只返回错误类型
+        logger.exception("持仓风险分析失败: %s", symbol)
+        raise HTTPException(502, f"风险分析失败：{type(exc).__name__}，请稍后重试") from exc
+
+
+@router.get("/paper/positions/risk")
+def position_risks():
+    """当日全部持仓风险记录（落库读取，供持仓表徽标）。"""
+    from app.llm.tasks.position_risk import load_position_risks
+
+    return load_position_risks()
+
+
+class NoteRequest(BaseModel):
+    date: str = ""  # 空 = 最新交易日
+    kind: str = "daily"  # daily=每日主笔记 / quick=盘中随手记
+    content: str = ""
+
+
+def _note_date(date: str) -> str:
+    from app.data import calendar
+
+    return date or calendar.latest_trade_date()
+
+
+@router.get("/paper/notes")
+def notes(date: str = "", kind: str = ""):
+    """交易笔记（默认最新交易日；kind 可筛选 daily/quick）。返回 {date, rows}。"""
+    from app.data.models import TradingNote
+
+    date = _note_date(date)
+    with database.get_session() as session:
+        query = session.query(TradingNote).filter(TradingNote.date == date)
+        if kind:
+            query = query.filter(TradingNote.kind == kind)
+        rows = query.order_by(TradingNote.id).all()
+        return {
+            "date": date,
+            "rows": [
+                {"id": r.id, "date": r.date, "kind": r.kind, "content": r.content,
+                 "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                 "updated_at": (r.updated_at or r.created_at).strftime("%Y-%m-%d %H:%M:%S")}
+                for r in rows
+            ],
+        }
+
+
+@router.post("/paper/notes")
+def create_note(req: NoteRequest):
+    """新增笔记；kind=daily 时同日已有则更新（每天一篇主笔记）。"""
+    from app.data.models import TradingNote
+
+    if req.kind not in ("daily", "quick"):
+        raise HTTPException(400, "kind 仅支持 daily/quick")
+    content = req.content.strip()
+    if not content:
+        raise HTTPException(400, "笔记内容不能为空")
+    date = _note_date(req.date)
+    with database.get_session() as session:
+        if req.kind == "daily":
+            row = (
+                session.query(TradingNote)
+                .filter(TradingNote.date == date, TradingNote.kind == "daily")
+                .first()
+            )
+            if row is not None:
+                row.content = content
+                session.commit()
+                return {"id": row.id, "date": date, "kind": "daily", "updated": True}
+        row = TradingNote(date=date, kind=req.kind, content=content)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return {"id": row.id, "date": date, "kind": req.kind, "updated": False}
+
+
+@router.put("/paper/notes/{note_id}")
+def update_note(note_id: int, req: NoteRequest):
+    from app.data.models import TradingNote
+
+    content = req.content.strip()
+    if not content:
+        raise HTTPException(400, "笔记内容不能为空")
+    with database.get_session() as session:
+        row = session.get(TradingNote, note_id)
+        if row is None:
+            raise HTTPException(404, "笔记不存在")
+        row.content = content
+        session.commit()
+        return {"id": row.id, "updated": True}
+
+
+@router.delete("/paper/notes/{note_id}")
+def delete_note(note_id: int):
+    from app.data.models import TradingNote
+
+    with database.get_session() as session:
+        row = session.get(TradingNote, note_id)
+        if row is None:
+            raise HTTPException(404, "笔记不存在")
+        session.delete(row)
+        session.commit()
+        return {"id": note_id, "deleted": True}
+
+
 @router.get("/paper/export-ths")
 def export_ths():
     """反向导出：模拟账户持仓/委托 → Excel（供与同花顺对照）。"""

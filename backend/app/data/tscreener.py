@@ -27,13 +27,14 @@ _lock = threading.Lock()
 
 
 def screen_tsymbols(
-    min_amount: float = 5e8,
-    min_amplitude: float = 0.03,
-    turnover_min: float = 3.0,   # 换手率统一为百分数（3 = 3%）
-    turnover_max: float = 10.0,
+    min_amount: float = 8e8,
+    min_amplitude: float = 0.04,
+    max_amplitude: float = 0.09,
+    turnover_min: float = 4.0,   # 换手率统一为百分数（4 = 4%）
+    turnover_max: float = 12.0,
     trend_window: int = 20,
     limit: int = 20,
-    trend_strict: bool = False,  # 弱势市场门控：额外要求 MA60 向上
+    trend_strict: bool = True,   # 60 日线向上强制（高要求）
 ) -> list[dict]:
     """返回候选列表 [{symbol, name, amount_avg, amplitude_avg, turnover_avg, ret_20, score}]。"""
     global _cache
@@ -46,25 +47,31 @@ def screen_tsymbols(
         instruments = {r.symbol: r for r in session.query(Instrument).all()}
 
     candidates = []
-    required = 60 if trend_strict else trend_window
+    required = 60  # 60 日线要求 → 至少 65 根日线
     for symbol in symbols:
         inst = instruments.get(symbol)
         if inst is None or inst.type == "index" or inst.is_st:
+            continue
+        if symbol.startswith("688"):  # 排除科创板（实盘无权限）
             continue
         df = _load_recent(symbol, n=required + 5)
         if df.empty or len(df) < required:
             continue
         result = _evaluate(df, symbol, inst.name,
-                           min_amount, min_amplitude, turnover_min, turnover_max,
+                           min_amount, min_amplitude, max_amplitude,
+                           turnover_min, turnover_max,
                            trend_window, trend_strict=trend_strict)
         if result:
             candidates.append(result)
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
+    # 只留一个推荐，其余全部次选
+    for i, c in enumerate(candidates):
+        c["level"] = "推荐" if i == 0 else "次选"
     with _lock:
         _cache = (time.monotonic(), candidates)
-    logger.info("做T候选池筛选完成：%d 个候选（共扫描 %d 只，严格趋势=%s）",
-                len(candidates), len(symbols), trend_strict)
+    logger.info("做T候选池筛选完成：%d 个候选（共扫描 %d 只）",
+                len(candidates), len(symbols))
     return candidates[:limit]
 
 
@@ -85,11 +92,13 @@ def coarse_screen_quotes(quotes: pd.DataFrame, top_n: int = 50,
     pct = pd.to_numeric(out["pct_change"], errors="coerce")
     amount = pd.to_numeric(out["amount"], errors="coerce")
     name = out["name"].astype(str)
+    symbol = out["symbol"].astype(str)
     mask = (
         (amount >= min_amount)
         & (out["amplitude_today"] >= min_amplitude)
         & (pct.abs() < 9.5)
         & (~name.str.contains("ST", case=False, na=False))
+        & (~symbol.str.startswith("688"))  # 排除科创板（实盘无权限）
     )
     out = out[mask].copy()
     if out.empty:
@@ -105,13 +114,16 @@ def coarse_screen_quotes(quotes: pd.DataFrame, top_n: int = 50,
 
 
 def _save_watch_zone(rows: list[dict]) -> int:
-    """粗筛观察区落库（按 symbol upsert，同日重复刷新覆盖）。"""
-    if not rows:
-        return 0
-    from datetime import datetime
+    """粗筛观察区落库（按 symbol upsert，同日重复刷新覆盖；清理历史日期旧数据）。"""
+    from app.data import calendar
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = calendar.latest_trade_date()  # 数据日期 = 最新交易日
     with database.get_session() as session:
+        # 清理历史日期的旧观察数据（避免陈旧数据残留展示）
+        session.query(TscreenWatch).filter(TscreenWatch.date != today).delete()
+        if not rows:
+            session.commit()
+            return 0
         for r in rows:
             existing = session.get(TscreenWatch, r["symbol"])
             if existing is None:
@@ -141,35 +153,39 @@ def load_watch_zone() -> list[dict]:
 
 
 def refresh_market_tscreen(top_n: int = 50) -> dict:
-    """全市场做T候选刷新：快照粗筛 → 补主表 → 定向同步日线 → 本地精筛。
+    """全市场做T候选刷新：快照粗筛 → 观察区落库 → 精筛。
 
-    约 3~6 分钟（网络绑定），由 API 后台任务或每日收盘调度触发。
+    铁律：观察区是快照粗筛结果，不依赖逐股日线——不再全量定向同步
+    （旧流程同步 250+ 只候选要 30 分钟以上，经常跑不完导致数据停在旧日期）。
+    精筛候选的日线由「自选池+持仓」每日同步与按需补齐覆盖。
     """
     from app.data.base import get_source
-    from app.data.sync import _upsert_instruments, sync_watchlist_bars
+    from app.data.sync import _upsert_instruments
     from app.data.symbols import board_of, exchange_of
 
     quotes = get_source().get_realtime_quotes(None)  # 全市场快照（含新浪回退，有 TTL 缓存）
+    if quotes is None or quotes.empty:
+        logger.warning("做T刷新中止：全市场快照为空")
+        return {"coarse": 0, "candidates": []}
     coarse = coarse_screen_quotes(quotes, top_n=top_n)
     if not coarse:
-        return {"coarse": 0, "synced": {}, "candidates": []}
+        logger.info("做T刷新完成：无粗筛候选")
+        _save_watch_zone([])
+        return {"coarse": 0, "candidates": []}
 
     # 补证券主表（快照自带名称/涨跌幅，主表信息用于精筛的 ST/类型过滤）
-    instrument_rows = [
+    _upsert_instruments([
         {"symbol": c["symbol"], "name": c["name"], "exchange": exchange_of(c["symbol"]),
          "type": "stock", "board": board_of(c["symbol"]), "status": "active",
          "list_date": "", "is_st": 0}
         for c in coarse
-    ]
-    _upsert_instruments(instrument_rows)
-
-    # 定向同步候选的日线（已有且为最新的会跳过）
-    stats = sync_watchlist_bars([c["symbol"] for c in coarse])
+    ])
 
     _save_watch_zone(coarse)
     candidates = screen_tsymbols(limit=50)
-    return {"coarse": len(coarse), "synced": stats,
-            "candidates": candidates, "watch_zone": coarse}
+    logger.info("做T刷新完成：观察区 %d 只（精筛候选 %d 只，日线按需补齐）",
+                len(coarse), len(candidates))
+    return {"coarse": len(coarse), "candidates": candidates, "watch_zone": coarse}
 
 
 def _load_recent(symbol: str, n: int = 25) -> pd.DataFrame:
@@ -185,16 +201,16 @@ def _load_recent(symbol: str, n: int = 25) -> pd.DataFrame:
     df = pd.DataFrame([
         {"trade_date": r.trade_date, "open": r.open, "high": r.high, "low": r.low,
          "close": r.close, "volume": r.volume, "amount": r.amount,
-         "turnover_rate": r.turnover_rate}
+         "turnover_rate": r.turnover_rate, "pct_change": r.pct_change}
         for r in rows
     ]).sort_values("trade_date").reset_index(drop=True)
     return df
 
 
 def _evaluate(df: pd.DataFrame, symbol: str, name: str,
-              min_amount: float, min_amplitude: float,
+              min_amount: float, min_amplitude: float, max_amplitude: float,
               turnover_min: float, turnover_max: float, trend_window: int,
-              trend_strict: bool = False) -> dict | None:
+              trend_strict: bool = True) -> dict | None:
     prev_close = df["close"].shift(1)
     amplitude = (df["high"] - df["low"]) / prev_close
 
@@ -202,7 +218,7 @@ def _evaluate(df: pd.DataFrame, symbol: str, name: str,
     if amount_avg < min_amount:
         return None
     amplitude_avg = float(amplitude.tail(5).mean())
-    if amplitude_avg < min_amplitude:
+    if not (min_amplitude <= amplitude_avg <= max_amplitude):
         return None
 
     turnover_avg = float(df["turnover_rate"].tail(5).mean())
@@ -210,12 +226,17 @@ def _evaluate(df: pd.DataFrame, symbol: str, name: str,
         if not (turnover_min <= turnover_avg <= turnover_max):
             return None
 
+    # 排除当日涨跌停（做T需要可自由进出）
+    last_pct = float(df["pct_change"].iloc[-1])
+    if last_pct >= 9.5 or last_pct <= -9.5:
+        return None
+
     close = df["close"]
     ma20 = close.rolling(trend_window).mean()
     trend_up = bool(close.iloc[-1] > ma20.iloc[-1]) and bool(ma20.iloc[-1] > ma20.iloc[-6])
     if not trend_up:
         return None
-    if trend_strict:  # 弱势市场门控：额外要求 60 日线向上且价格站上
+    if trend_strict:  # 严格要求 60 日线向上且价格站上（不再按市场强弱放松）
         ma60 = close.rolling(60).mean()
         if not (close.iloc[-1] > ma60.iloc[-1] and bool(ma60.iloc[-1] > ma60.iloc[-6])):
             return None

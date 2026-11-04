@@ -130,11 +130,14 @@ def account_summary() -> dict:
                 for r in session.query(Instrument).filter(Instrument.symbol.in_(position_symbols)).all()
             }
 
+    from app.utils.timeutil import in_trading_hours
+
     position_list = []
     market_value = 0.0
     for p in positions:
-        # 估值价优先用引擎缓存的最新行情（盘中实时），其次本地日线收盘
-        price = _engine_latest_price(p.symbol) or 0.0
+        # 估值价：交易时段用引擎实时轮询价；非交易时段直接用当日日线收盘价
+        # （引擎缓存可能停在旧交易日，收盘后必须用日线，保证持仓市价实时）
+        price = _engine_latest_price(p.symbol) if in_trading_hours() else 0.0
         if price <= 0:
             latest = loader.get_latest_bar(p.symbol)
             price = latest["close"] if latest else p.avg_cost

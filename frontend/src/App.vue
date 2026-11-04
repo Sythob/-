@@ -1,9 +1,20 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 
+import request from './api/request'
 import AssistantChat from './components/AssistantChat.vue'
 import { applyTheme, currentTheme, THEMES } from './themes'
+
+// 进入系统即触发补跑（收盘后自动拉数据+生成日报；收盘前后端会跳过）
+onMounted(() => {
+  if (sessionStorage.getItem('onenter-done')) return
+  sessionStorage.setItem('onenter-done', '1')
+  request.post('/system/onenter').then((resp) => {
+    const data = resp as unknown as { task_id: string }
+    sessionStorage.setItem('onenter-task', data.task_id)
+  }).catch(() => { /* 后端未启动等场景忽略 */ })
+})
 
 const route = useRoute()
 

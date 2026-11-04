@@ -3,6 +3,8 @@
 增量策略：akshare 不支持按股增量取数 → 全量拉取 + INSERT OR REPLACE 幂等 upsert，
 天然修复历史缺口。自选池（默认几十只）每日同步 1~2 分钟完成；全市场同步是周末手动选项。
 """
+import pandas as pd
+
 from app.config import get_settings
 from app.data import calendar, database
 from app.data.base import get_source
@@ -21,8 +23,11 @@ INDEX_INSTRUMENTS = [
     ("399006", "创业板指", "sz", "index", "", "active", "", 0),
     ("000300", "沪深300", "sh", "index", "", "active", "", 0),
 ]
-# 可与个股代码共存、允许入库历史的指数（000300 沪深300 为回测基准）
-INDEX_HISTORY_WHITELIST = {"000300", "399001", "399006"}
+# 允许入库历史的指数：键=库内存储代码，值=数据源代码。
+# 上证指数源代码 000001 与平安银行个股撞代码，库内存储为 sh000001（唯一特例）；
+# 000300/399001/399006 本身不与个股撞码，保持裸代码（000300 为回测基准，勿改）。
+INDEX_HISTORY_WHITELIST = {"sh000001": "000001", "000300": "000300",
+                           "399001": "399001", "399006": "399006"}
 
 _NUMERIC_BAR_COLS = {
     "open", "high", "low", "close", "volume", "amount",
@@ -202,32 +207,51 @@ def sync_watchlist_bars(symbols: list[str] | None = None, source=None) -> dict:
     return stats
 
 
+def _fill_index_volume(df: pd.DataFrame, src_code: str) -> pd.DataFrame:
+    """腾讯指数源无成交量（全 0）→ 用 baostock 按日期补成交量（失败不影响主流程）。"""
+    try:
+        if df["volume"].fillna(0).ne(0).any():
+            return df
+        from app.data import baostock_source
+
+        vol = baostock_source.get_daily_bars(src_code, start=str(df["trade_date"].min()), end=str(df["trade_date"].max()))
+        if vol is None or vol.empty:
+            return df
+        vm = dict(zip(vol["trade_date"], vol["volume"]))
+        df["volume"] = df["trade_date"].map(vm).fillna(df["volume"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("指数成交量补齐失败 %s: %s", src_code, exc)
+    return df
+
+
 def sync_index_bars(symbols: list[str] | None = None, source=None) -> dict:
-    """指数日线同步（仅白名单：沪深300 等，供回测基准对比）。"""
+    """指数日线同步（白名单指数，供回测基准与首页指数走势图）。"""
     source = source or get_source()
     symbols = symbols or sorted(INDEX_HISTORY_WHITELIST)
     stats = {"updated": [], "skipped": [], "failed": []}
     latest_date = calendar.latest_trade_date()
-    for symbol in symbols:
-        if symbol not in INDEX_HISTORY_WHITELIST:
+    for stored in symbols:
+        if stored not in INDEX_HISTORY_WHITELIST:
             continue
+        src_code = INDEX_HISTORY_WHITELIST[stored]
         try:
-            latest = get_latest_bar(symbol)
+            latest = get_latest_bar(stored)
             if latest and latest["trade_date"] >= latest_date:
-                stats["skipped"].append(symbol)
+                stats["skipped"].append(stored)
                 continue
-            df = source.get_index_daily_bars(symbol)
+            df = source.get_index_daily_bars(src_code)
             if df is None or df.empty:
-                stats["failed"].append(symbol)
+                stats["failed"].append(stored)
                 continue
+            df = _fill_index_volume(df, src_code)
             rows = df.to_dict("records")
             for row in rows:
-                row["symbol"] = symbol
+                row["symbol"] = stored
             _upsert_daily_bars(rows)
-            stats["updated"].append(symbol)
+            stats["updated"].append(stored)
         except Exception as exc:
-            logger.warning("指数同步失败 %s: %s", symbol, exc)
-            stats["failed"].append(symbol)
+            logger.warning("指数同步失败 %s: %s", stored, exc)
+            stats["failed"].append(stored)
     return stats
 
 

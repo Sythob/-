@@ -14,6 +14,7 @@ from app.data import database
 def tmp_db(tmp_path, monkeypatch):
     """把默认库替换为临时文件并建表；返回 session 工厂；结束重置引擎。"""
     monkeypatch.setattr(get_settings(), "database_path", str(tmp_path / "test.db"))
+    monkeypatch.setattr(get_settings(), "startup_catchup", False)  # 测试关闭启动补跑（防真实网络）
     database.reset_engine()
     database.init_db()
     from app.data.calendar import invalidate_cache

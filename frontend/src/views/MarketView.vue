@@ -174,6 +174,12 @@ async function loadBoardScreen() {
   } catch { boardCandidates.value = [] }
 }
 
+// 连板池页签：boardTab = board（首板/打板）| streak（连板≥2板）
+const boardTab = ref<'board' | 'streak'>('board')
+const streakCandidates = computed(() =>
+  boardCandidates.value.filter((r) => (r.streak || 0) >= 2).sort((a, b) => b.streak - a.streak),
+)
+
 /** 打板数据日期与过期判断（周末/节假日不告警） */
 const boardDate = computed(() => boardCandidates.value[0]?.date || '')
 const boardStale = computed(() => {
@@ -376,7 +382,14 @@ onMounted(async () => {
         </div>
         <el-table :data="tscreenCandidates" size="small" max-height="160" highlight-current-row
                   @row-click="(row: any) => loadBars(row.symbol)">
-          <el-table-column prop="name" label="名称" width="90" />
+          <el-table-column label="级别" width="62">
+            <template #default="{ row }">
+              <el-tag :type="row.level === '推荐' ? 'danger' : 'info'" size="small">
+                {{ row.level || '次选' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="name" label="名称" width="85" />
           <el-table-column label="振幅%" width="70">
             <template #default="{ row }">{{ row.amplitude_avg?.toFixed(2) }}</template>
           </el-table-column>
@@ -500,17 +513,30 @@ onMounted(async () => {
           数据日期：{{ boardDate }}
           <el-tag v-if="boardStale" type="warning" size="small">数据未更新到今天，点右上角「刷新」</el-tag>
         </div>
-        <el-table :data="boardCandidates" size="small" max-height="340" highlight-current-row
+        <el-tabs v-model="boardTab" size="small" style="margin-bottom: 4px">
+          <el-tab-pane :label="`打板候选（${boardCandidates.length}）`" name="board" />
+          <el-tab-pane :label="`连板候选（${streakCandidates.length}）`" name="streak" />
+        </el-tabs>
+        <el-table
+          v-if="boardTab === 'board'"
+          :data="boardCandidates" size="small" max-height="340" highlight-current-row
                   @row-click="(row: any) => loadBars(row.symbol)">
-          <el-table-column prop="name" label="名称" width="90" />
-          <el-table-column label="涨幅" width="75">
+          <el-table-column prop="name" label="名称" width="85" />
+          <el-table-column label="涨幅" width="72">
             <template #default="{ row }">
               <span :class="(row.pct_change || 0) >= 0 ? 'text-up' : 'text-down'">
                 {{ row.pct_change > 0 ? '+' : '' }}{{ row.pct_change?.toFixed(2) }}%
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="连板" width="60">
+          <el-table-column prop="sector" label="板块" width="85" show-overflow-tooltip />
+          <el-table-column label="上涨原因" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span v-if="row.reason">{{ row.reason }}</span>
+              <span v-else class="tip">--</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="连板" width="58">
             <template #default="{ row }">
               <el-tag v-if="row.streak >= 1" :type="row.streak >= 3 ? 'danger' : 'warning'" size="small">
                 {{ row.streak }}板
@@ -532,7 +558,51 @@ onMounted(async () => {
             </template>
           </el-table-column>
         </el-table>
-        <el-empty v-if="!boardCandidates.length" description="暂无打板候选（今日涨停数少，或点刷新扫描）" :image-size="50" />
+        <el-table
+          v-else-if="streakCandidates.length"
+          :data="streakCandidates" size="small" max-height="340" highlight-current-row
+          @row-click="(row: any) => loadBars(row.symbol)"
+        >
+          <el-table-column prop="name" label="名称" width="85" />
+          <el-table-column label="连板" width="70" sortable :sort-by="(r: any) => r.streak">
+            <template #default="{ row }">
+              <el-tag :type="row.streak >= 4 ? 'danger' : 'warning'" size="small">{{ row.streak }}连板</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="sector" label="板块" width="85" show-overflow-tooltip />
+          <el-table-column label="上涨原因" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span v-if="row.reason">{{ row.reason }}</span>
+              <span v-else class="tip">--</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="涨幅" width="72">
+            <template #default="{ row }">
+              <span :class="(row.pct_change || 0) >= 0 ? 'text-up' : 'text-down'">
+                {{ row.pct_change > 0 ? '+' : '' }}{{ row.pct_change?.toFixed(2) }}%
+              </span>
+            </template>
+          </el-table-column>
+          <el-table-column label="换手" width="65">
+            <template #default="{ row }">{{ row.turnover?.toFixed(1) }}%</template>
+          </el-table-column>
+          <el-table-column label="成交额" width="72">
+            <template #default="{ row }">{{ (row.amount / 1e8).toFixed(1) }}亿</template>
+          </el-table-column>
+          <el-table-column label="风险" width="75">
+            <template #default="{ row }">
+              <el-tag :type="row.risk === '高位风险' ? 'danger' : row.risk === '一字板' ? 'info' : 'success'" size="small">
+                {{ row.risk }}
+              </el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty
+          v-if="boardTab === 'streak' && !streakCandidates.length"
+          description="今日无连板（≥2板）股票：市场情绪偏弱或题材退潮，注意风险"
+          :image-size="50"
+        />
+        <el-empty v-else-if="!boardCandidates.length" description="暂无打板候选（今日涨停数少，或点刷新扫描）" :image-size="50" />
         <p class="tip" style="margin-top: 6px">筛选：今日涨幅≥7%（各板涨停线分别判定）；连板高度与换手质量评分。⚠️ 打板是极高风险操作，候选仅供参考，不构成操作建议</p>
       </el-card>
     </el-col>

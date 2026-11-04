@@ -113,6 +113,16 @@ def run_backtest(req: BacktestRequest):
     symbols = req.symbols or get_settings().watchlist_symbols
     if not symbols:
         raise HTTPException(400, "请提供标的列表")
+    # 名称 → 代码解析（6 位代码直用；名称模糊匹配证券主表）
+    from app.api.paper import _resolve_symbol
+
+    resolved = []
+    for sym in symbols:
+        try:
+            resolved.append(_resolve_symbol(sym))
+        except HTTPException as exc:
+            raise HTTPException(400, f"标的「{sym}」：{exc.detail}") from exc
+    req.symbols = resolved
     try:
         StrategyRegistry.get(req.strategy)
     except KeyError:
@@ -122,7 +132,7 @@ def run_backtest(req: BacktestRequest):
         row = BacktestRun(
             strategy_name=req.strategy,
             params_json=json.dumps(req.params),
-            universe_json=json.dumps(symbols),
+            universe_json=json.dumps(resolved),
             start_date=req.start, end_date=req.end,
             capital=req.capital, status="pending",
         )

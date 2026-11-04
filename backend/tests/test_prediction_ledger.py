@@ -12,9 +12,9 @@ from app.main import app
 
 
 def test_extract_predictions_writes_ledger(tmp_db):
-    n = asyncio.run(extract_predictions(
+    rows = asyncio.run(extract_predictions(
         MockProvider(), "# 报告\n## 五、明日关注\n判断：沪深300 明日收涨", "2026-10-21"))
-    assert n == 1
+    assert len(rows) == 1  # 返回入库条目列表（含 id，供双模型复核回写）
     with database.get_session() as session:
         row = session.query(AiPrediction).one()
         assert row.report_date == "2026-10-21"
@@ -48,6 +48,23 @@ def test_verify_skips_same_day_pending(tmp_db):
     assert n == 0 and text == ""
     with database.get_session() as session:
         assert session.query(AiPrediction).one().verdict == "pending"
+
+
+def test_weekly_predictions_wait_until_week_end(tmp_db):
+    """周度预测在目标周结束（下周五）前不核验——周一不提前判'下周涨跌'。"""
+    with database.get_session() as session:
+        session.add(AiPrediction(report_date="2026-10-23", horizon="weekly",
+                                 category="大盘", content="判断：沪深300 下周收涨",
+                                 verdict="pending"))
+        session.commit()
+    # 下周一（10-26）：周未结束，不核验
+    text, n = asyncio.run(verify_pending_predictions(MockProvider(), "2026-10-26"))
+    assert n == 0 and text == ""
+    # 下周五之后（10-31）：核验
+    text2, n2 = asyncio.run(verify_pending_predictions(MockProvider(), "2026-10-31"))
+    assert n2 == 1
+    with database.get_session() as session:
+        assert session.query(AiPrediction).one().verdict == "correct"
 
 
 def test_wrong_verdict_saves_lesson(tmp_db, monkeypatch):

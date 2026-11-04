@@ -39,8 +39,11 @@ def test_chat_api_endpoint(tmp_db, monkeypatch):
     from app.config import get_settings
     from app.main import app
 
-    # 测试必须离线：清空 Key 强制 MockProvider
+    # 测试必须离线：清空 Key 强制 MockProvider；助手默认本地模型 → 也 mock 掉
     monkeypatch.setattr(get_settings(), "deepseek_api_key", "")
+    from app.llm.mock_provider import MockProvider
+
+    monkeypatch.setattr("app.llm.local.LocalProvider", lambda: MockProvider())
     monkeypatch.setattr(
         "app.data.sentiment.market_regime",
         lambda: {"regime": "neutral", "date": "2024-01-05", "advance": 2500, "decline": 2500,

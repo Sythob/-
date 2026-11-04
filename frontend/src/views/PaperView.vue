@@ -9,6 +9,72 @@ import BaseChart from '../components/BaseChart.vue'
 const account = ref<Record<string, any> | null>(null)
 const orders = ref<Record<string, any>[]>([])
 const equity = ref<{ date: string; equity: number }[]>([])
+// 持仓风险分析
+const posRisks = ref<Record<string, any>[]>([])
+const riskDialog = ref(false)
+const riskDetail = ref<Record<string, any> | null>(null)
+const riskLoading = ref(false)
+// 交易笔记
+const noteDate = ref('')
+const noteDaily = ref('')
+const noteQuick = ref('')
+const noteList = ref<Record<string, any>[]>([])
+const noteSaving = ref(false)
+
+async function loadNotes() {
+  try {
+    const resp = (await request.get('/paper/notes', { params: { date: noteDate.value || '' } })) as {
+      date: string
+      rows: Record<string, any>[]
+    }
+    noteDate.value = resp.date
+    noteList.value = resp.rows
+  } catch { noteList.value = [] }
+  const daily = noteList.value.find((n) => n.kind === 'daily')
+  noteDaily.value = daily?.content || ''
+  noteQuick.value = ''
+}
+
+async function saveDailyNote() {
+  if (!noteDaily.value.trim()) return
+  noteSaving.value = true
+  try {
+    await request.post('/paper/notes', { date: noteDate.value, kind: 'daily', content: noteDaily.value.trim() })
+    ElMessage.success('每日笔记已保存（AI 复盘会引用）')
+    await loadNotes()
+  } finally { noteSaving.value = false }
+}
+
+async function addQuickNote() {
+  if (!noteQuick.value.trim()) return
+  noteSaving.value = true
+  try {
+    await request.post('/paper/notes', { date: noteDate.value, kind: 'quick', content: noteQuick.value.trim() })
+    noteQuick.value = ''
+    await loadNotes()
+  } finally { noteSaving.value = false }
+}
+
+async function deleteNote(id: number) {
+  await request.delete(`/paper/notes/${id}`)
+  await loadNotes()
+}
+
+function prevNoteDay() {
+  noteDate.value = shiftDay(noteDate.value, -1)
+  loadNotes()
+}
+
+function nextNoteDay() {
+  noteDate.value = shiftDay(noteDate.value, 1)
+  loadNotes()
+}
+
+function shiftDay(dateStr: string, delta: number): string {
+  const d = new Date(dateStr)
+  d.setDate(d.getDate() + delta)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
 const orderDialog = ref(false)
 const submitting = ref(false)
 
@@ -85,10 +151,47 @@ async function load() {
   try {
     equity.value = (await request.get('/paper/equity')) as { date: string; equity: number }[]
   } catch { equity.value = [] }
+  try {
+    posRisks.value = (await request.get('/paper/positions/risk')) as Record<string, any>[]
+  } catch { posRisks.value = [] }
+  await loadNotes()  // 默认取最新交易日的笔记
+}
+
+const RISK_TAG: Record<string, { label: string; type: string }> = {
+  低: { label: '低风险', type: 'success' },
+  中: { label: '中风险', type: 'warning' },
+  高: { label: '高风险', type: 'danger' },
+}
+
+function riskOf(symbol: string) {
+  return posRisks.value.find((r) => r.symbol === symbol) || null
+}
+
+async function analyzeRisk(symbol: string, name: string) {
+  riskLoading.value = true
+  riskDialog.value = true
+  riskDetail.value = null
+  try {
+    const result = (await request.post(`/paper/positions/${symbol}/risk`, null, { timeout: 120000 })) as Record<string, any>
+    riskDetail.value = { ...result, name }
+    await load()
+  } finally {
+    riskLoading.value = false
+  }
+}
+
+function showRisk(symbol: string, name: string) {
+  const r = riskOf(symbol)
+  if (!r) return
+  riskDetail.value = { ...r, name }
+  riskDialog.value = true
 }
 
 async function submitOrder() {
-  if (!orderForm.value.symbol) return
+  if (!orderForm.value.symbol) {
+    ElMessage.warning('请先输入股票代码或名称（如 600519 或 茅台）')
+    return
+  }
   submitting.value = true
   try {
     // AI 风控检查需调用大模型（约 10 秒），放宽超时
@@ -210,6 +313,29 @@ onMounted(load)
               </span>
             </template>
           </el-table-column>
+          <el-table-column label="风险" width="110">
+            <template #default="{ row }">
+              <el-tag
+                v-if="riskOf(row.symbol)"
+                :type="(RISK_TAG[(riskOf(row.symbol) as any).risk_level] || {}).type"
+                size="small"
+                style="cursor: pointer"
+                @click="showRisk(row.symbol, row.name)"
+              >
+                {{ (riskOf(row.symbol) as any).risk_level }} · {{ (riskOf(row.symbol) as any).score }}分
+              </el-tag>
+              <el-button
+                v-else
+                link
+                type="primary"
+                size="small"
+                :loading="riskLoading"
+                @click="analyzeRisk(row.symbol, row.name)"
+              >
+                分析
+              </el-button>
+            </template>
+          </el-table-column>
         </el-table>
         <el-empty v-if="!account?.positions?.length" description="暂无持仓" :image-size="60" />
       </el-card>
@@ -217,6 +343,43 @@ onMounted(load)
   </el-row>
 
   <el-row :gutter="12" style="margin-top: 12px">
+    <el-col :span="12">
+      <el-card shadow="never">
+        <template #header>
+          交易笔记
+          <span class="header-actions">
+            <el-button-group size="small">
+              <el-button @click="prevNoteDay">◀ 前一日</el-button>
+              <el-button @click="nextNoteDay">后一日 ▶</el-button>
+            </el-button-group>
+          </span>
+        </template>
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
+          <b style="font-size: 14px">{{ noteDate }}</b>
+          <span class="tip">笔记会自动提供给 AI 复盘，复盘将对照你的思路点评</span>
+        </div>
+        <el-input
+          v-model="noteDaily"
+          type="textarea"
+          :rows="3"
+          maxlength="2000"
+          show-word-limit
+          placeholder="记录今天的交易思路：为什么买/卖、对行情的判断、明天的计划..."
+        />
+        <div style="margin: 8px 0 12px; text-align: right">
+          <el-button type="primary" size="small" :loading="noteSaving" @click="saveDailyNote">保存每日笔记</el-button>
+        </div>
+        <div style="display: flex; gap: 8px">
+          <el-input v-model="noteQuick" size="small" placeholder="盘中随手记一条..." @keyup.enter="addQuickNote" />
+          <el-button size="small" @click="addQuickNote">记一条</el-button>
+        </div>
+        <div v-for="n in noteList.filter((x) => x.kind === 'quick')" :key="n.id" class="quick-note">
+          <span class="tip">{{ n.created_at.slice(5, 16) }}</span>
+          <span style="margin-left: 8px">{{ n.content }}</span>
+          <el-button link type="danger" size="small" style="float: right" @click="deleteNote(n.id)">删</el-button>
+        </div>
+      </el-card>
+    </el-col>
     <el-col :span="12">
       <el-card shadow="never">
         <template #header>委托记录</template>
@@ -250,10 +413,13 @@ onMounted(load)
         </el-table>
       </el-card>
     </el-col>
-    <el-col :span="12">
+  </el-row>
+
+  <el-row :gutter="12" style="margin-top: 12px">
+    <el-col :span="24">
       <el-card shadow="never">
         <template #header>净值曲线</template>
-        <BaseChart v-if="equity.length" :option="equityOption" height="320px" />
+        <BaseChart v-if="equity.length" :option="equityOption" height="260px" />
         <el-empty v-else description="暂无净值（收盘结算后生成）" :image-size="60" />
       </el-card>
     </el-col>
@@ -355,6 +521,35 @@ onMounted(load)
       <el-button type="primary" :loading="thsImporting" @click="submitThsImport">开始导入</el-button>
     </template>
   </el-dialog>
+
+  <!-- 持仓风险详情弹窗 -->
+  <el-dialog v-model="riskDialog" :title="`${riskDetail?.name || ''} 持仓风险分析`" width="520px">
+    <template v-if="riskLoading">
+      <el-skeleton :rows="5" animated />
+      <div class="tip" style="margin-top: 8px">AI 风险分析中（约 10~20 秒）...</div>
+    </template>
+    <template v-else-if="riskDetail">
+      <div style="margin-bottom: 10px">
+        <el-tag :type="(RISK_TAG[riskDetail.risk_level] || {}).type" size="large">
+          {{ (RISK_TAG[riskDetail.risk_level] || {}).label }}
+        </el-tag>
+        <span style="margin-left: 10px; color: var(--app-text-secondary)">
+          风险分 {{ riskDetail.score }} / 100 · {{ riskDetail.date }} · 模型 {{ riskDetail.model }}
+        </span>
+      </div>
+      <div class="risk-section">风险因素</div>
+      <ul class="reasons">
+        <li v-for="(f, i) in riskDetail.factors" :key="i">{{ f }}</li>
+      </ul>
+      <div class="risk-section">操作建议</div>
+      <p style="line-height: 1.7">{{ riskDetail.suggestion }}</p>
+    </template>
+    <template #footer>
+      <el-button @click="riskDialog = false">关闭</el-button>
+      <el-button v-if="!riskLoading" type="primary" :loading="riskLoading"
+        @click="analyzeRisk(riskDetail!.symbol, riskDetail!.name)">重新分析</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <style scoped>
@@ -383,5 +578,18 @@ onMounted(load)
 .pos-symbol {
   color: var(--app-text-secondary);
   font-size: 12px;
+}
+
+.risk-section {
+  font-weight: 600;
+  margin: 10px 0 6px;
+  color: var(--app-text);
+}
+
+.quick-note {
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--app-border);
+  font-size: 13px;
+  line-height: 1.6;
 }
 </style>

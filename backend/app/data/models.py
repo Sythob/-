@@ -258,7 +258,7 @@ class AiLesson(Base):
 
 
 class BoardWatch(Base):
-    """打板候选池（当日涨停/近涨停候选，含连板高度与风险标注）"""
+    """打板候选池（当日涨停/近涨停候选，含连板高度、板块与上涨原因）"""
 
     __tablename__ = "board_watch"
 
@@ -270,7 +270,18 @@ class BoardWatch(Base):
     amount: Mapped[float] = mapped_column(Float, default=0.0)
     score: Mapped[float] = mapped_column(Float, default=0.0)
     risk: Mapped[str] = mapped_column(String(20), default="")
+    sector: Mapped[str] = mapped_column(String(30), default="")  # 所属行业板块
+    reason: Mapped[str] = mapped_column(String(120), default="")  # LLM 上涨原因（含题材梗）
     date: Mapped[str] = mapped_column(String(10), default="")
+
+
+class StockSector(Base):
+    """股票→行业板块映射（新浪行业成分股，每周更新，供候选池/分析标注板块）。"""
+
+    __tablename__ = "stock_sector"
+
+    symbol: Mapped[str] = mapped_column(String(10), primary_key=True)
+    sector: Mapped[str] = mapped_column(String(30), default="")
 
 
 class TscreenWatch(Base):
@@ -301,6 +312,36 @@ class AiReport(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
 
 
+class TradingNote(Base):
+    """交易笔记：每日主笔记（kind=daily，每天一篇）+ 盘中随手记（kind=quick）。"""
+
+    __tablename__ = "trading_note"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    date: Mapped[str] = mapped_column(String(10), index=True)  # 交易日
+    kind: Mapped[str] = mapped_column(String(10), default="daily")  # daily/quick
+    content: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class PositionRisk(Base):
+    """持仓风险分析（每交易日每持仓一条，落库可回看历史）。"""
+
+    __tablename__ = "position_risk"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, index=True, default=1)
+    symbol: Mapped[str] = mapped_column(String(10), index=True)
+    date: Mapped[str] = mapped_column(String(10), index=True)  # 分析基准日（最新交易日）
+    risk_level: Mapped[str] = mapped_column(String(10), default="中")  # 低/中/高
+    score: Mapped[float] = mapped_column(Float, default=50.0)  # 风险分 0~100，越高越危险
+    factors: Mapped[str] = mapped_column(Text, default="")  # 风险因素，换行分隔
+    suggestion: Mapped[str] = mapped_column(Text, default="")  # 操作建议
+    model: Mapped[str] = mapped_column(String(50), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class AiPrediction(Base):
     """AI 预测台账：每条预测逐条记录、次日自动核验对错、错误沉淀教训。"""
 
@@ -316,6 +357,8 @@ class AiPrediction(Base):
     actual: Mapped[str] = mapped_column(Text, default="")  # 实际行情描述
     lesson: Mapped[str] = mapped_column(Text, default="")  # 错误教训（正确的为空）
     error_analysis: Mapped[str] = mapped_column(Text, default="")  # 错误归因：哪条数据依据判断失误（正确的为空）
+    basis_json: Mapped[str] = mapped_column(Text, default="[]")  # 结构化依据：[{metric, value, note}]
+    second_opinion: Mapped[str] = mapped_column(String(20), default="")  # 本地模型复核：同意/不同意/分歧
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 

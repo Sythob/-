@@ -12,7 +12,7 @@
 import math
 import time
 
-from app.data import calendar
+from app.data import calendar, database
 from app.utils.logger import get_logger
 
 logger = get_logger("data.market_extra")
@@ -82,6 +82,61 @@ def get_sector_detail(name: str) -> dict:
         return {"name": name, "stocks": rows}
 
     return _cached(f"sector_detail_{name}", 120, fetch)
+
+
+# ---------------------------------------------------------------- 板块映射
+
+def sync_sector_membership() -> dict:
+    """股票→行业板块映射全量重建（新浪 49 行业成分股，约 2~3 分钟）。"""
+    from app.data.models import StockSector
+    from app.data.sectors import get_sectors
+
+    sectors = get_sectors()
+    if not sectors:
+        raise RuntimeError("板块列表为空（数据源不可用）")
+    total = 0
+    with database.get_session() as session:
+        session.query(StockSector).delete()
+        session.commit()
+    for row in sectors:
+        label = row["label"]
+        name = row["name"]
+        try:
+            df = _ak().stock_sector_detail(sector=label)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("板块成分股获取失败 %s: %s", name, exc)
+            continue
+        with database.get_session() as session:
+            for _, r in df.iterrows():
+                code = str(r.get("code", "") or r.get("代码", "") or "").strip()
+                if code:
+                    session.merge(StockSector(symbol=code, sector=name))
+                    total += 1
+            session.commit()
+    logger.info("板块映射重建完成：%d 只股票", total)
+    return {"stocks": total, "sectors": len(sectors)}
+
+
+def get_sector_map() -> dict[str, str]:
+    """{代码: 行业板块} 映射（内存缓存，表为空时自动全量重建）。"""
+    global _sector_map_cache
+    now = time.monotonic()
+    if _sector_map_cache[0] and now - _sector_map_cache[0] < 3600:
+        return _sector_map_cache[1]
+    from app.data.models import StockSector
+
+    with database.get_session() as session:
+        rows = session.query(StockSector).all()
+    if not rows:
+        sync_sector_membership()
+        with database.get_session() as session:
+            rows = session.query(StockSector).all()
+    mapping = {r.symbol: r.sector for r in rows}
+    _sector_map_cache = (now, mapping)
+    return mapping
+
+
+_sector_map_cache: tuple[float, dict[str, str]] = (0.0, {})
 
 
 # ---------------------------------------------------------------- 龙虎榜

@@ -13,7 +13,7 @@ from app.data.tscreener import (
 )
 
 
-def _seed(tmp_db, symbol, name="测试股", n=30, price=50.0, amplitude=0.05,
+def _seed(tmp_db, symbol, name="测试股", n=70, price=50.0, amplitude=0.05,
           amount=1e9, turnover=6.0, drift=0.002, is_st=0):
     """合成日线：可指定振幅/成交额/换手/趋势。"""
     rng = np.random.default_rng(hash(symbol) % 9999)
@@ -36,12 +36,13 @@ def _seed(tmp_db, symbol, name="测试股", n=30, price=50.0, amplitude=0.05,
 
 
 def test_evaluate_passes_good_candidate():
-    close = np.linspace(50, 55, 25)  # 温和上升趋势
+    close = np.linspace(50, 55, 70)  # 温和上升趋势（70 根满足 MA60 强制要求）
     df = pd.DataFrame({
         "open": close * 0.99, "high": close * 1.03, "low": close * 0.98, "close": close,
-        "volume": [2e7] * 25, "amount": [1e9] * 25, "turnover_rate": [6.0] * 25,
+        "volume": [2e7] * 70, "amount": [1e9] * 70, "turnover_rate": [6.0] * 70,
+        "pct_change": [1.0] * 70,
     })
-    result = _evaluate(df, "600001", "好票", 5e8, 0.03, 3.0, 10.0, 20)
+    result = _evaluate(df, "600001", "好票", 8e8, 0.04, 0.09, 4.0, 12.0, 20)
     assert result is not None
     assert result["symbol"] == "600001"
     assert result["score"] > 0
@@ -51,16 +52,18 @@ def test_evaluate_rejects_low_amount():
     df = pd.DataFrame({
         "open": [50.0] * 25, "high": [52.6] * 25, "low": [49.9] * 25, "close": [51.0] * 25,
         "volume": [1e5] * 25, "amount": [1e7] * 25, "turnover_rate": [6.0] * 25,
+        "pct_change": [1.0] * 25,
     })
-    assert _evaluate(df, "x", "小票", 5e8, 0.03, 0.03, 0.10, 20) is None  # 成交额不足
+    assert _evaluate(df, "x", "小票", 8e8, 0.04, 0.09, 4.0, 12.0, 20) is None  # 成交额不足
 
 
 def test_evaluate_rejects_low_amplitude():
     df = pd.DataFrame({
         "open": [50.0] * 25, "high": [50.2] * 25, "low": [49.8] * 25, "close": [50.0] * 25,
         "volume": [2e7] * 25, "amount": [1e9] * 25, "turnover_rate": [6.0] * 25,
+        "pct_change": [0.5] * 25,
     })
-    assert _evaluate(df, "x", "横盘票", 5e8, 0.03, 0.03, 0.10, 20) is None  # 振幅不足
+    assert _evaluate(df, "x", "横盘票", 8e8, 0.04, 0.09, 4.0, 12.0, 20) is None  # 振幅不足
 
 
 def test_evaluate_rejects_downtrend():
@@ -68,8 +71,9 @@ def test_evaluate_rejects_downtrend():
     df = pd.DataFrame({
         "open": close * 0.99, "high": close * 1.03, "low": close * 0.97, "close": close,
         "volume": [2e7] * 25, "amount": [1e9] * 25, "turnover_rate": [6.0] * 25,
+        "pct_change": [-1.0] * 25,
     })
-    assert _evaluate(df, "x", "下跌票", 5e8, 0.03, 0.03, 0.10, 20) is None  # 趋势向下
+    assert _evaluate(df, "x", "下跌票", 8e8, 0.04, 0.09, 4.0, 12.0, 20) is None  # 趋势向下
 
 
 def _spot_quotes():
@@ -90,6 +94,9 @@ def _spot_quotes():
         {"symbol": "600005", "name": "横盘票", "last_price": 10.1, "pct_change": 1.0,
          "open": 10.0, "high": 10.2, "low": 9.9, "pre_close": 10.0,
          "volume": 5e7, "amount": 5e8},
+        {"symbol": "688001", "name": "科创股", "last_price": 10.5, "pct_change": 5.0,
+         "open": 10.0, "high": 10.8, "low": 9.9, "pre_close": 10.0,
+         "volume": 5e7, "amount": 5e8},
     ])
 
 
@@ -101,6 +108,7 @@ def test_coarse_screen_filters():
     assert "600003" not in symbols  # 涨停排除
     assert "600004" not in symbols  # 成交额不足排除
     assert "600005" not in symbols  # 振幅不足排除
+    assert "688001" not in symbols  # 科创板排除
 
 
 def test_coarse_screen_empty():
@@ -165,17 +173,23 @@ def test_evaluate_trend_strict():
     df = pd.DataFrame({
         "open": close * 0.99, "high": close * 1.03, "low": close * 0.98, "close": close,
         "volume": [2e7] * n, "amount": [1e9] * n, "turnover_rate": [6.0] * n,
+        "pct_change": [1.0] * n,
     })
-    assert _evaluate(df, "x", "反弹股", 5e8, 0.03, 3.0, 10.0, 20, trend_strict=False) is not None
-    assert _evaluate(df, "x", "反弹股", 5e8, 0.03, 3.0, 10.0, 20, trend_strict=True) is None
+    assert _evaluate(df, "x", "反弹股", 8e8, 0.04, 0.09, 4.0, 12.0, 20, trend_strict=False) is not None
+    assert _evaluate(df, "x", "反弹股", 8e8, 0.04, 0.09, 4.0, 12.0, 20, trend_strict=True) is None
 
 
 def test_screen_excludes_st_and_index(tmp_db):
     _seed(tmp_db, "600001", "好票", amount=1e9, amplitude=0.05, drift=0.003)
     _seed(tmp_db, "600002", "ST票", amount=1e9, amplitude=0.05, drift=0.003, is_st=1)
     _seed(tmp_db, "600003", "烂票", amount=1e7, amplitude=0.05, drift=0.003)
+    _seed(tmp_db, "688999", "科创票", amount=1e9, amplitude=0.05, drift=0.003)
     result = screen_tsymbols()
     symbols = {r["symbol"] for r in result}
     assert "600001" in symbols
     assert "600002" not in symbols  # ST 排除
     assert "600003" not in symbols  # 流动性不足排除
+    assert "688999" not in symbols  # 科创板排除
+    # 推荐/次选标记：第一只 = 推荐，其余 = 次选
+    levels = {r["symbol"]: r["level"] for r in result}
+    assert levels["600001"] == "推荐"

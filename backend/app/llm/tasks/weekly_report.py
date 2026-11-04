@@ -194,7 +194,7 @@ async def generate_weekly_report(provider=None, date: str | None = None) -> dict
     # 下周预测入台账（horizon=weekly，下周自动核验）
     from app.llm.tasks.daily_report import extract_predictions
 
-    n_pred = await extract_predictions(provider, content, last_date, horizon="weekly")
-    logger.info("周报已生成: id=%s date=%s 预测=%d 条", row.id, last_date, n_pred)
+    pred_rows = await extract_predictions(provider, content, last_date, horizon="weekly")
+    logger.info("周报已生成: id=%s date=%s 预测=%d 条", row.id, last_date, len(pred_rows))
     return {"id": row.id, "title": row.title, "content_md": row.content_md,
-            "model": provider.name, "predictions": n_pred}
+            "model": provider.name, "predictions": len(pred_rows)}

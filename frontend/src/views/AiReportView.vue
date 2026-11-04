@@ -48,15 +48,20 @@ async function loadPredictions() {
   try {
     const data = (await request.get('/ai/predictions', { params: { limit: 200 } })) as {
       stats: Record<string, any>
+      basis_stats: string
       rows: Record<string, any>[]
     }
     predStats.value = data.stats
+    basisStatsText.value = data.basis_stats
     predRows.value = data.rows
   } catch {
     predStats.value = null
     predRows.value = []
+    basisStatsText.value = ''
   }
 }
+
+const basisStatsText = ref('')
 
 async function generateWeekly() {
   loading.value = true
@@ -143,13 +148,40 @@ function switchType(type: string) {
   }
 }
 
+const reportRunning = ref(false)
+const reportStatus = ref('')
+let reportTimer: number | undefined
+
 async function generateReport() {
-  loading.value = true
+  reportRunning.value = true
+  reportStatus.value = '生成中：检查/补齐今日数据 → AI 撰写复盘（约 1~3 分钟，请勿重复点击）...'
   try {
-    await request.post('/ai/reports/generate')
-    await loadList()
-  } finally {
-    loading.value = false
+    const resp = (await request.post('/ai/reports/generate')) as { task_id: string }
+    reportTimer = window.setInterval(async () => {
+      try {
+        const task = (await request.get(`/system/tasks/${resp.task_id}`)) as Record<string, any>
+        if (task.status === 'done') {
+          window.clearInterval(reportTimer)
+          reportRunning.value = false
+          const result = task.result || {}
+          if (result.skipped) {
+            reportStatus.value = result.reason || '今日复盘已存在'
+          } else {
+            reportStatus.value = '日报已生成'
+          }
+          activeType.value = 'daily'
+          activeId.value = null
+          await loadList()
+        } else if (task.status === 'failed') {
+          window.clearInterval(reportTimer)
+          reportRunning.value = false
+          reportStatus.value = `生成失败：${task.error || '未知错误'}（数据源恢复后会自动重试）`
+        }
+      } catch { /* 轮询失败重试 */ }
+    }, 5000)
+  } catch {
+    reportRunning.value = false
+    reportStatus.value = '任务提交失败，请稍后重试'
   }
 }
 
@@ -200,6 +232,23 @@ const html = computed(() => {
 })
 
 onMounted(loadList)
+
+// 进入系统补跑完成 → 自动刷新报告列表（用户进入系统后日报自动出现）
+onMounted(() => {
+  const taskId = sessionStorage.getItem('onenter-task')
+  if (!taskId) return
+  const timer = window.setInterval(async () => {
+    try {
+      const task = (await request.get(`/system/tasks/${taskId}`)) as Record<string, any>
+      if (task.status === 'done' || task.status === 'failed') {
+        window.clearInterval(timer)
+        sessionStorage.removeItem('onenter-task')
+        activeId.value = null
+        await loadList()
+      }
+    } catch { /* 轮询失败重试 */ }
+  }, 5000)
+})
 </script>
 
 <template>
@@ -209,7 +258,7 @@ onMounted(loadList)
         <template #header>
           AI 报告
           <span class="header-actions">
-            <el-button size="small" type="primary" @click="generateReport">生成日报</el-button>
+            <el-button size="small" type="primary" :loading="reportRunning" @click="generateReport">生成日报</el-button>
             <el-button size="small" type="success" @click="generateWeekly">生成周报</el-button>
             <el-button size="small" type="warning" :loading="forecastRunning" @click="runNewsForecast">热点预测</el-button>
           </span>
@@ -219,6 +268,7 @@ onMounted(loadList)
           <el-tab-pane label="预测战绩" name="predictions" />
         </el-tabs>
         <div v-if="forecastStatus" class="tip" style="margin-bottom: 8px">{{ forecastStatus }}</div>
+        <div v-if="reportStatus" class="tip" style="margin-bottom: 8px">{{ reportStatus }}</div>
         <template v-if="activeType !== 'predictions' && activeType !== 'news'">
           <div v-if="activeType === 'multiagent'" style="margin-bottom: 10px">
             <el-input v-model="maSymbol" placeholder="输入代码或名称，如 600519 或 茅台" size="small" style="width: 220px" @keyup.enter="runMultiagent" />
@@ -276,17 +326,37 @@ onMounted(loadList)
               <span v-else>--</span>
             </el-descriptions-item>
           </el-descriptions>
-          <el-table :data="predRows" size="small" max-height="430">
+          <div v-if="basisStatsText" style="margin-bottom: 8px">
+            <div class="tip" style="margin-bottom: 4px">依据可信度（历史预测按依据指标的准确率统计，AI 生成新预测时优先用可靠依据）：</div>
+            <div class="basis-stats">{{ basisStatsText }}</div>
+          </div>
+          <el-table :data="predRows" size="small" max-height="400">
             <el-table-column prop="report_date" label="日期" width="90" />
             <el-table-column label="类型" width="70">
               <template #default="{ row }">{{ row.horizon === 'weekly' ? '周' : '日' }}/{{ row.category }}</template>
             </el-table-column>
-            <el-table-column prop="content" label="预测内容" min-width="180" show-overflow-tooltip />
+            <el-table-column label="预测内容" min-width="200">
+              <template #default="{ row }">
+                <div>{{ row.content }}</div>
+                <div v-if="row.basis?.length" style="margin-top: 3px">
+                  <el-tag v-for="b in row.basis" :key="b.metric" size="small" effect="plain" style="margin: 0 4px 2px 0">
+                    {{ b.metric }}={{ b.value }}
+                  </el-tag>
+                </div>
+              </template>
+            </el-table-column>
             <el-table-column label="结果" width="95">
               <template #default="{ row }">
                 <el-tag :type="(VERDICT_TAG[row.verdict] || {}).type" size="small">
                   {{ (VERDICT_TAG[row.verdict] || {}).label || row.verdict }}
                 </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="双模型" width="80">
+              <template #default="{ row }">
+                <el-tag v-if="row.second_opinion === '同意'" type="success" size="small">一致</el-tag>
+                <el-tag v-else-if="row.second_opinion === '不同意'" type="warning" size="small">分歧</el-tag>
+                <span v-else class="tip">--</span>
               </template>
             </el-table-column>
             <el-table-column prop="actual" label="实际情况" min-width="130" show-overflow-tooltip />
@@ -340,5 +410,15 @@ onMounted(loadList)
 .tip {
   color: var(--app-text-secondary);
   font-size: 12px;
+}
+
+.basis-stats {
+  white-space: pre-line;
+  font-size: 12px;
+  color: var(--app-text-secondary);
+  background: var(--app-bg);
+  border-radius: 4px;
+  padding: 8px 10px;
+  line-height: 1.8;
 }
 </style>

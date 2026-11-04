@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # ---- 服务 ----
     host: str = "127.0.0.1"
     port: int = 8000
+    startup_catchup: bool = True  # 启动补跑漏跑任务（测试环境关闭，防止离线测试触发真实网络）
     timezone: str = "Asia/Shanghai"
 
     # ---- 数据库 ----

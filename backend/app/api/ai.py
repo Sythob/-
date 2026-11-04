@@ -41,12 +41,18 @@ def report_detail(report_id: int):
 
 @router.post("/ai/reports/generate")
 def generate_report():
-    try:
+    """生成日报（后台任务模式）：立即返回 task_id，前端轮询进度。
+
+    数据缺失时任务内部先补同步（有 120 秒超时保护），任何网络问题都不会
+    变成用户看到的报错——任务最终要么生成成功、要么给出明确的失败原因。
+    """
+    from app.utils import tasks
+
+    def _gen():
         return asyncio.run(generate_daily_report())
-    except RuntimeError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"日报生成失败: {exc}") from exc
+
+    task_id = tasks.submit(_gen)
+    return {"task_id": task_id}
 
 
 @router.get("/ai/predictions")
@@ -67,16 +73,28 @@ def predictions(horizon: str = "", verdict: str = "", limit: int = 100):
             stats[r.verdict] = stats.get(r.verdict, 0) + 1
             total += 1
         judged = stats.get("correct", 0) + stats.get("wrong", 0) + stats.get("partial", 0)
+        import json as _json
+
+        from app.llm.tasks.daily_report import basis_stats as _basis_stats
+
+        def _basis(r) -> list:
+            try:
+                return _json.loads(r.basis_json or "[]")
+            except Exception:  # noqa: BLE001
+                return []
+
         return {
             "stats": {"total": total, "correct": stats.get("correct", 0),
                       "wrong": stats.get("wrong", 0), "partial": stats.get("partial", 0),
                       "pending": stats.get("pending", 0),
                       "accuracy": round(stats.get("correct", 0) / judged * 100, 1) if judged else None},
+            "basis_stats": _basis_stats(),
             "rows": [
                 {"id": r.id, "report_date": r.report_date, "horizon": r.horizon,
                  "category": r.category, "symbol": r.symbol, "content": r.content,
                  "verdict": r.verdict, "actual": r.actual, "lesson": r.lesson,
-                 "error_analysis": r.error_analysis,
+                 "error_analysis": r.error_analysis, "basis": _basis(r),
+                 "second_opinion": r.second_opinion,
                  "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")}
                 for r in rows
             ],

@@ -321,7 +321,7 @@ onMounted(loadStrategies)
             </el-select>
           </el-form-item>
           <el-form-item label="标的代码">
-            <el-input v-model="form.symbols" placeholder="逗号分隔，如 600519,000001" />
+            <el-input v-model="form.symbols" placeholder="逗号分隔，支持代码或名称，如 600519,茅台,宁德时代" />
           </el-form-item>
           <el-form-item label="开始日期">
             <el-date-picker v-model="form.start" type="date" value-format="YYYY-MM-DD" style="width: 100%" />

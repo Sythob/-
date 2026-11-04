@@ -4,6 +4,8 @@
 但仍执行三重防护：语法解析、白名单 import、禁用危险函数。
 """
 import ast
+import html
+import json
 import re
 from pathlib import Path
 
@@ -141,6 +143,21 @@ async def generate_strategy(description: str, provider=None) -> dict:
         (GENERATED_DIR / f"{name}.py").write_text(_strip_markdown(code), encoding="utf-8")
         row = Strategy(name=name, kind="generated", params_json="{}", code=_strip_markdown(code))
         session.add(row)
+        # 同步写入 AI 报告（代码生成页签展示用）
+        # 安全：description/name 为外部输入，嵌入 Markdown 前转义（防 XSS）；
+        # meta_json 用 json.dumps 而非手动拼串。
+        from app.data.models import AiReport
+
+        safe_name = html.escape(name)
+        safe_desc = html.escape(description)
+        session.add(AiReport(
+            report_type="codegen",
+            title=f"策略生成 {safe_name}",
+            content_md=f"# 策略 {safe_name}\n\n描述：{safe_desc}\n\n```python\n{_strip_markdown(code)}\n```",
+            meta_json=json.dumps({"name": name, "description": description},
+                                 ensure_ascii=False),
+            model=provider.name,
+        ))
         session.commit()
         session.refresh(row)
         logger.info("策略生成成功: %s (%d 字符)", name, len(code))

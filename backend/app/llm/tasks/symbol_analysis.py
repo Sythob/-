@@ -23,11 +23,29 @@ SYSTEM_PROMPT = """你是 A股个股分析师。基于给定的行情统计与�
 
 async def analyze_symbol(symbol: str, provider=None) -> dict:
     provider = provider or get_provider()
-    stats = build_stock_stats(symbol)
-    news = recent_news_summary(symbol, limit=10)
-    from datetime import datetime
+    from app.data import calendar as calendar_module
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = calendar_module.latest_trade_date()  # 日期 = 最新交易日（周末补跑不写错日期）
+    # 幂等：当日已有该股解读则跳过
+    with database.get_session() as session:
+        exists = (
+            session.query(AiReport)
+            .filter(AiReport.report_type == "stock", AiReport.title.like(f"{symbol} %{today}"))
+            .first()
+        )
+    if exists is not None:
+        logger.info("个股解读已存在，跳过 %s", symbol)
+        return {"skipped": True, "id": exists.id}
+    stats = build_stock_stats(symbol)
+    # 数据保障：本地历史不足先补同步（避免"无足够行情数据"）
+    if "无足够" in str(stats.get("数据", "")):
+        from app.data.sync import sync_watchlist_bars
+
+        logger.info("个股解读：%s 本地行情不足，先补同步", symbol)
+        sync_watchlist_bars([symbol])
+        stats = build_stock_stats(symbol)
+    news = recent_news_summary(symbol, limit=10)
+
     user_prompt = (
         f"股票代码：{symbol}\n行情统计：{stats}\n近期新闻情绪：\n{news or '无'}\n"
         f"请输出解读报告。"

@@ -25,18 +25,24 @@ ANALYST_SYSTEMS = {
         "你是技术面分析师。基于给定的行情统计（涨跌幅/波动/RSI 等）输出 JSON："
         '{"view": "bullish"或"bearish"或"neutral", "confidence": 0~1, '
         '"key_points": ["不超过40字的技术要点", 最多3条], "risks": ["技术风险", 最多2条]}'
+        "铁律：key_points 禁止为空，至少 1 条；必须给出明确方向（bullish/bearish/neutral 三选一）。"
     ),
     "news": (
         "你是消息面分析师。基于给定的近期新闻情绪归纳输出 JSON（格式同技术面）："
         "归纳利好/利空/中性分布，注意消息的时效与重要性。"
+        "铁律：key_points 禁止为空——即使新闻很少或无新闻，也要基于可得信息给出至少 1 条判断"
+        "（如'近期无重大消息，情绪面中性，需关注后续公告'），并明确说明数据缺口。"
     ),
     "fund_flow": (
         "你是资金面分析师。基于给定的量价与两融数据输出 JSON（格式同技术面）："
         "关注量能变化、换手率、两融余额趋势对个股的含义。"
+        "铁律：key_points 禁止为空——数据不足时用可得数据推断（如两融整体趋势对个股资金环境的影响），"
+        "至少 1 条并明确说明数据缺口。"
     ),
     "market_env": (
         "你是市场环境分析师。基于给定的市场广度（涨跌停/涨跌家数）与热门板块输出 JSON（格式同技术面）："
         "判断当前大盘环境对该股操作的影响（顺风/逆风）。"
+        "铁律：key_points 禁止为空，至少 1 条——广度与板块数据足够给出该股所处环境的判断。"
     ),
 }
 
@@ -73,18 +79,53 @@ def _collect_data(symbol: str) -> dict:
     """收集各分析师输入（全部本地/缓存数据）。"""
     stats = build_stock_stats(symbol)
     news = recent_news_summary(symbol, limit=8)
+    # 已打分新闻为空时回退到原始新闻标题（保证消息面分析师有输入）
+    if not news:
+        from app.data.models import News
+
+        with database.get_session() as session:
+            rows = (
+                session.query(News)
+                .filter(News.symbol == symbol)
+                .order_by(News.pub_time.desc()).limit(8).all()
+            )
+        news = "\n".join(f"- [未打分] {r.title}" for r in rows) or "近期无该股新闻"
     try:
+        import concurrent.futures
+
         from app.data.sentiment import get_sentiment_overview
 
-        sentiment = get_sentiment_overview()
+        # 两融接口访问上交所官网可能很慢：线程执行 + 15 秒超时。
+        # 注意不能用 with（__exit__ 会等待挂起线程），shutdown(wait=False) 丢弃慢线程。
+        pool = concurrent.futures.ThreadPoolExecutor(1)
+        try:
+            sentiment = pool.submit(get_sentiment_overview).result(timeout=15)
+        finally:
+            pool.shutdown(wait=False)
         breadth = sentiment["breadth"][0] if sentiment["breadth"] else {}
         margin = sentiment.get("margin", {})
         env = f"广度({breadth.get('date', '')}): 涨停 {breadth.get('limit_up', '?')} 家, " \
               f"跌停 {breadth.get('limit_down', '?')} 家, 上涨 {breadth.get('advance', '?')} 家, " \
               f"下跌 {breadth.get('decline', '?')} 家; " \
               f"两融余额 {margin.get('margin_balance', 0) / 1e8:.0f} 亿元" if margin.get("margin_balance") else "暂无情绪数据"
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 情绪数据缺失/超时不影响分析
         env = "暂无市场情绪数据"
+    # 该股近 5 日量能（资金面分析师输入）
+    try:
+        from app.data.models import DailyBar
+
+        with database.get_session() as session:
+            bars = (
+                session.query(DailyBar)
+                .filter(DailyBar.symbol == symbol)
+                .order_by(DailyBar.trade_date.desc()).limit(5).all()
+            )
+        volume = "、".join(
+            f"{b.trade_date[5:]}(量{b.volume / 1e6:.1f}万手 额{b.amount / 1e8:.1f}亿 换手{b.turnover_rate:.1f}%)"
+            for b in reversed(bars)
+        ) or "无量能数据"
+    except Exception:  # noqa: BLE001
+        volume = "无量能数据"
     try:
         from app.data.sectors import get_sectors
 
@@ -103,7 +144,47 @@ def _collect_data(symbol: str) -> dict:
     except Exception:  # noqa: BLE001
         portfolio = "无模拟持仓信息"
     return {"stats": stats, "news": news, "env": env, "sectors": top_sectors,
-            "portfolio": portfolio}
+            "portfolio": portfolio, "volume": volume}
+
+
+def _extract_key_points(result: dict) -> list[str]:
+    """兼容模型多种返回结构提取要点（标准 key_points / data_summary / signal 兜底）。"""
+    points = result.get("key_points") or []
+    if isinstance(points, str):
+        points = [points]
+    if not points:
+        ds = result.get("data_summary", {})
+        if isinstance(ds, dict):
+            points = [str(v) for v in ds.values() if str(v).strip()]
+        elif isinstance(ds, str) and ds.strip():
+            points = [ds]
+    if not points and result.get("signal"):
+        points = [f"信号：{result['signal']}"]
+    return [str(p)[:60] for p in points if str(p).strip()][:3]
+
+
+def _extract_view(result: dict) -> str:
+    """兼容标准 view 字段与 signal 字段推导观点。"""
+    view = str(result.get("view", "")).lower()
+    if view in ("bullish", "bearish", "neutral"):
+        return view
+    signal = str(result.get("signal", ""))
+    if "看多" in signal or "买入" in signal or "bull" in signal.lower():
+        return "bullish"
+    if "看空" in signal or "卖出" in signal or "bear" in signal.lower():
+        return "bearish"
+    return "neutral"
+
+
+def _data_snippet(role: str, data: dict) -> str:
+    """分析师兜底要点：如实列出其收到的数据摘要（模型两次返回空时使用，不编造）。"""
+    if role == "news":
+        return f"近期新闻：{str(data.get('news', ''))[:60] or '无'}"
+    if role == "fund_flow":
+        return f"近5日量能：{str(data.get('volume', ''))[:60] or '无'}"
+    if role == "market_env":
+        return f"市场环境：{str(data.get('env', ''))[:60] or '无'}"
+    return f"行情统计：{str(data.get('stats', ''))[:60]}"
 
 
 # ---------------------------------------------------------------- 主流程
@@ -112,21 +193,40 @@ async def _call_analyst(provider, role: str, symbol: str, data: dict) -> dict:
     prompts = {
         "technical": f"股票 {symbol} 行情统计：{data['stats']}",
         "news": f"股票 {symbol} 近期新闻情绪：\n{data['news'] or '无'}",
-        "fund_flow": f"股票 {symbol} 量价与两融：{data['stats']}；{data['env']}",
+        "fund_flow": (
+            f"请基于以下数据回答问题并输出 JSON：\n"
+            f"1) 股票 {symbol} 近5日量能与换手变化如何解读？\n"
+            f"2) 当前市场资金环境（广度/两融）对该股是顺风还是逆风？\n"
+            f"3) 综合以上，你的判断是 bullish/bearish/neutral？\n\n"
+            f"数据：近5日量能：{data['volume']}\n市场资金环境：{data['env']}"
+        ),
         "market_env": f"市场环境：{data['env']}；当前热门板块：{data['sectors']}",
     }
     try:
+        messages = [{"role": "system", "content": ANALYST_SYSTEMS[role]},
+                    {"role": "user", "content": prompts[role]}]
         result = await asyncio.wait_for(
-            provider.chat_json(
-                [{"role": "system", "content": ANALYST_SYSTEMS[role]},
-                 {"role": "user", "content": prompts[role]}],
-                temperature=0.3, schema_hint="multiagent",
-            ),
+            provider.chat_json(messages, temperature=0.3, schema_hint="multiagent"),
             timeout=60,
         )
-        return {"role": role, "name": ANALYST_NAMES[role], "view": result.get("view", "neutral"),
+        key_points = _extract_key_points(result)
+        # 空要点补救：重试一次并强调必须输出要点（防止"只有一个分析师在分析"）
+        if not key_points:
+            logger.info("分析师 %s 要点为空，强化指令重试", role)
+            messages.append({"role": "user",
+                             "content": "你上轮 key_points 为空，这是不合格的。请立即基于上述数据"
+                                        "重新输出 JSON，key_points 至少 1 条。"})
+            result = await asyncio.wait_for(
+                provider.chat_json(messages, temperature=0.3, schema_hint="multiagent"),
+                timeout=60,
+            )
+            key_points = _extract_key_points(result)
+        # 两次仍空：确定性兜底（列出该分析师收到的真实数据要点，不编造）
+        if not key_points:
+            key_points = [f"{ANALYST_NAMES[role]}数据不足：{_data_snippet(role, data)}"]
+        return {"role": role, "name": ANALYST_NAMES[role], "view": _extract_view(result),
                 "confidence": float(result.get("confidence", 0.5)),
-                "key_points": list(result.get("key_points", []))[:3],
+                "key_points": key_points,
                 "risks": list(result.get("risks", []))[:2]}
     except Exception as exc:  # noqa: BLE001 单个分析师失败不影响整体
         logger.warning("分析师 %s 失败: %s", role, exc)

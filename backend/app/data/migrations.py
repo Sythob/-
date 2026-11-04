@@ -23,6 +23,12 @@ _COLUMNS = {
     ],
     "ai_prediction": [
         ("error_analysis", "TEXT DEFAULT ''"),
+        ("basis_json", "TEXT DEFAULT '[]'"),
+        ("second_opinion", "VARCHAR(20) DEFAULT ''"),
+    ],
+    "board_watch": [
+        ("sector", "VARCHAR(30) DEFAULT ''"),
+        ("reason", "VARCHAR(120) DEFAULT ''"),
     ],
 }
 

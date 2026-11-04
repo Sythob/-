@@ -60,35 +60,54 @@ def forecast_exists_for_date(date: str) -> bool:
 
 
 async def generate_news_forecast(provider=None, news: list[str] | None = None) -> dict:
-    """生成热点新闻明日预测报告（幂等：同日已生成则跳过）。"""
+    """生成热点新闻行情预测（预测目标 = 下一交易日）。
+
+    - 交易日生成：预测次日行情；
+    - 周末/节假日生成：聚合最新周末新闻（新浪快讯含周末发布），预测下一交易日（周一）；
+    - 幂等：同一目标日已生成且是今天生成的 → 跳过；昨天生成的（如周六的版本）
+      会被今天（周日）更全的新闻替换——周末预测逐日更新。
+    """
+    from datetime import date as date_type
+
+    from app.data import calendar as calendar_module
+    from app.llm.tasks.daily_report import _next_trade_date
+
     provider = provider or get_provider()
+    latest_trade = calendar_module.latest_trade_date()
+    target = _next_trade_date(latest_trade)  # 预测目标日（下一交易日）
     today = datetime.now().strftime("%Y-%m-%d")
-    if forecast_exists_for_date(today):
-        with database.get_session() as session:
-            row = (
-                session.query(AiReport)
-                .filter(AiReport.report_type == "news_forecast", AiReport.title.like(f"%{today}%"))
-                .first()
-            )
-            return {"id": row.id, "title": row.title, "content_md": row.content_md,
-                    "model": row.model, "skipped": True}
+    with database.get_session() as session:
+        row = (
+            session.query(AiReport)
+            .filter(AiReport.report_type == "news_forecast", AiReport.title.like(f"%{target}%"))
+            .first()
+        )
+        if row is not None:
+            if row.created_at.strftime("%Y-%m-%d") == today:
+                return {"id": row.id, "title": row.title, "content_md": row.content_md,
+                        "model": row.model, "skipped": True}
+            session.delete(row)  # 旧日版本 → 用更新新闻替换
+            session.commit()
+            row = None
 
     news_list = news if news is not None else fetch_market_news()
     market = assistant_context()
     news_text = "\n".join(f"- {n}" for n in news_list) if news_list else "今日无市场新闻（数据源暂不可用）"
+    weekday = "周" + "一二三四五六日"[date_type.fromisoformat(target).weekday()]
     content = await provider.chat([
         {"role": "system", "content": FORECAST_SYSTEM},
         {"role": "user", "content": (
-            f"今日热点新闻：\n{news_text}\n\n市场数据快照：\n{market}\n\n请输出明日行情预测。"
+            f"最新热点新闻：\n{news_text}\n\n市场数据快照：\n{market}\n\n"
+            f"请输出下一交易日（{target} {weekday}）的行情预测。"
         )},
     ], temperature=0.4)
 
     with database.get_session() as session:
         row = AiReport(
             report_type="news_forecast",
-            title=f"新闻热点明日行情预测 {today}",
+            title=f"新闻热点行情预测 {target}（{weekday}）",
             content_md=content,
-            meta_json=f'{{"date": "{today}", "news_count": {len(news_list)}}}',
+            meta_json=f'{{"date": "{target}", "news_count": {len(news_list)}}}',
             model=provider.name,
         )
         session.add(row)
