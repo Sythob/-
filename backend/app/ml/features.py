@@ -74,6 +74,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["volume_trend"] = volume.rolling(10).mean() / \
         volume.rolling(30).mean().replace(0, np.nan) - 1           # 量能趋势
 
+    # ---- Alpha158 因子库（Qlib 官方公式，159 列）----
+    from app.ml.alpha158 import build_alpha158
+
+    out = pd.concat([out, build_alpha158(df)], axis=1)
+
     # ---- 标签 ----
     out["next_ret"] = close.shift(-1) / close - 1
     out["label"] = (out["next_ret"] > 0).astype(int)

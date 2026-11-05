@@ -30,6 +30,9 @@ _COLUMNS = {
         ("sector", "VARCHAR(30) DEFAULT ''"),
         ("reason", "VARCHAR(120) DEFAULT ''"),
     ],
+    "news": [
+        ("finbert_score", "FLOAT"),
+    ],
 }
 
 

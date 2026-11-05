@@ -140,6 +140,38 @@ def job_news_sentiment():
     asyncio.run(score_news(30))
 
 
+@_safe("news_finbert")
+def job_news_finbert():
+    """本地 finbert-tone 对未打分新闻批量打分（ML 情绪因子数据源）。
+
+    模型不可用/未安装时静默跳过，不影响其他任务。
+    """
+    from app.data import database
+    from app.data.models import News
+    from app.ml.news_sentiment_factor import batch_score
+
+    with database.get_session() as session:
+        rows = (
+            session.query(News)
+            .filter(News.finbert_score.is_(None))
+            .order_by(News.id.desc()).limit(300).all()
+        )
+        if not rows:
+            return
+        ids = [r.id for r in rows]
+        texts = [r.title for r in rows]
+    try:
+        scores = batch_score(texts)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("finbert 打分失败（跳过本轮）: %s", exc)
+        return
+    with database.get_session() as session:
+        for rid, score in zip(ids, scores):
+            session.query(News).filter(News.id == rid).update({"finbert_score": score})
+        session.commit()
+    logger.info("finbert 情绪打分完成：%d 条", len(scores))
+
+
 @_safe("daily_report")
 def job_daily_report():
     if not calendar.is_trade_day():
@@ -298,6 +330,8 @@ def start_scheduler() -> None:
                        misfire_grace_time=3600, id="fetch_news")
     _scheduler.add_job(job_news_sentiment, CronTrigger(day_of_week="mon-fri", hour=17, minute=30),
                        misfire_grace_time=3600, id="news_sentiment")
+    _scheduler.add_job(job_news_finbert, CronTrigger(day_of_week="mon-fri", hour=17, minute=35),
+                       misfire_grace_time=3600, id="news_finbert")
     _scheduler.add_job(job_position_risk, CronTrigger(day_of_week="mon-fri", hour=17, minute=40),
                        misfire_grace_time=3600, id="position_risk")
     _scheduler.add_job(job_symbol_analysis, CronTrigger(day_of_week="mon-fri", hour=17, minute=35),

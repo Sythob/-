@@ -30,6 +30,13 @@ class MLSignalStrategy(Strategy):
         self._model = model
         for symbol, df in data.items():
             feats = build_features(df)
+            # 训练含情绪因子的模型时推理同样合并（历史无新闻 → 0，中性）
+            try:
+                from app.ml.news_sentiment_factor import merge_sentiment_features
+
+                feats = merge_sentiment_features(feats, symbol)
+            except Exception:  # noqa: BLE001
+                pass
             feats = feats.dropna(subset=self._model.feature_names)
             if feats.empty:
                 continue

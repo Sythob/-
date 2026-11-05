@@ -86,6 +86,7 @@ class News(Base):
     sentiment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     sentiment_label: Mapped[str | None] = mapped_column(String(10), nullable=True)  # 利好/利空/中性
     sentiment_reason: Mapped[str] = mapped_column(Text, default="")
+    finbert_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # 本地模型情绪分 [-1,1]（ML 因子）
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 

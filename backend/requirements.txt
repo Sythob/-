@@ -22,3 +22,7 @@ xlrd>=2.0
 lxml>=5.0
 pytest>=8.0
 pytest-asyncio>=0.23
+baostock
+# 新闻情绪因子（finbert-tone 本地模型，ML 特征用）
+torch>=2.0
+transformers>=4.40

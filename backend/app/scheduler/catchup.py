@@ -78,6 +78,15 @@ def _catch_up_body() -> dict:
         tasks.submit(_safe_sync_hour_bars)
         result["repaired"].append("60分钟线")
 
+    # 本地 finbert 情绪打分（ML 因子数据源；模型未就绪/无未打分新闻时静默跳过）
+    with database.get_session() as session:
+        from app.data.models import News
+
+        unscored = session.query(News.id).filter(News.finbert_score.is_(None)).first()
+    if unscored is not None:
+        tasks.submit(_safe_news_finbert)
+        result["repaired"].append("新闻情绪因子打分")
+
     with database.get_session() as session:
         stock_done = session.query(AiReport).filter(
             AiReport.report_type == "stock", AiReport.title.like(f"%{lt}%")).count()
@@ -141,6 +150,15 @@ def _safe_sync_hour_bars():
         sync_hour_bars()
     except Exception:  # noqa: BLE001
         logger.exception("补跑60分钟线失败")
+
+
+def _safe_news_finbert():
+    try:
+        from app.scheduler.jobs import job_news_finbert
+
+        job_news_finbert()
+    except Exception:  # noqa: BLE001
+        logger.exception("补跑新闻情绪因子打分失败")
 
 
 def _safe_symbol_analysis():

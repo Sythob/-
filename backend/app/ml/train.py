@@ -40,10 +40,20 @@ def train_pipeline(
         if df.empty:
             logger.warning("跳过无数据的标的: %s", symbol)
             continue
-        frames.append(build_features(df))
+        frames.append((symbol, build_features(df)))
     if not frames:
         raise ValueError("所有标的均无数据，无法训练")
-    pooled = pd.concat(frames, ignore_index=True)
+
+    # 1.5 新闻情绪因子合并（本地 finbert 打分新闻，无新闻 → 0；失败不影响主流程）
+    try:
+        from app.ml.news_sentiment_factor import load_sentiment_frame, merge_sentiment_features
+
+        sent = load_sentiment_frame([s for s, _ in frames])
+        frames = [(s, merge_sentiment_features(f, s, sent)) for s, f in frames]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("新闻情绪因子合并失败（继续用纯量价特征训练）: %s", exc)
+
+    pooled = pd.concat([f for _, f in frames], ignore_index=True)
 
     feats = feature_columns(pooled)
     pooled = pooled.dropna(subset=feats + ["label"])

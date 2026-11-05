@@ -142,42 +142,83 @@ def basis_stats(min_samples: int = 2) -> str:
     return "\n".join(lines)
 
 
-def _build_ml_signals() -> str:
-    """已训练 ML 模型对标的的明日上涨概率（AI+ML 双引擎参考）。"""
-    from app.data import calendar as calendar_module
+def _predict_symbols(model, row, symbols: list[str], model_name: str, lt: str) -> list[str]:
+    """用已训练模型对一组标的逐只预测明日上涨概率，返回报告行。"""
+    from app.ml.features import build_features
+    from app.ml.news_sentiment_factor import merge_sentiment_features
 
-    lt = calendar_module.latest_trade_date()
+    model_feats = json.loads(row.features_json or "[]")
     lines = []
-    try:
-        from app.ml.features import build_features
-        from app.ml.persistence import list_models
-
-        models = {m["name"]: m for m in list_models()}
-        seen: set[str] = set()
-        for name, info in models.items():
-            try:
-                symbol = name.split("_")[1]
-            except IndexError:
-                continue
-            if symbol in seen:  # 同名旧模型跳过（保留最新）
-                continue
-            seen.add(symbol)
-            from app.ml.persistence import load_model_by_name
-
-            loaded = load_model_by_name(name)
-            if loaded is None:
-                continue
-            model, _row = loaded
+    for symbol in symbols:
+        try:
             df = loader.load_daily(symbol, adjust="qfq")
             if df.empty or len(df) < 40:
                 continue
             feats = build_features(df)
             if feats.empty:
                 continue
-            proba_arr = model.predict_proba(feats.iloc[[-1]])
-            proba = float(proba_arr[0])  # predict_proba 已返回一维（正类概率）
-            lines.append(f"ML 模型（{name}）：{symbol} 明日上涨概率 {proba * 100:.0f}%"
+            # 训练含情绪因子时推理同样合并（无新闻 → 0）
+            feats = merge_sentiment_features(feats, symbol)
+            # 只取模型训练时登记的特征列（老模型无 Alpha158 特征，保持兼容）
+            cols = [c for c in model_feats if c in feats.columns]
+            if not cols:
+                continue
+            proba = float(model.predict_proba(feats[cols].iloc[[-1]])[0])
+            lines.append(f"ML 模型（{model_name}）：{symbol} 明日上涨概率 {proba * 100:.0f}%"
                          f"（截至 {lt}）")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ML 预测失败 %s: %s", symbol, exc)
+    return lines
+
+
+def _build_ml_signals() -> str:
+    """已训练 ML 模型对标的的明日上涨概率（AI+ML 双引擎参考）。
+
+    两类模型：单标的模型（名称含 6 位代码，只预测该标的）；
+    池化模型（全市场/自选池训练，名称不含代码）对自选池+持仓逐只预测。
+    """
+    from app.data import calendar as calendar_module
+
+    lt = calendar_module.latest_trade_date()
+    lines: list[str] = []
+    try:
+        from app.ml.persistence import list_models, load_model_by_name
+
+        pooled_targets = list(get_settings().watchlist_symbols)
+        from app.paper import account as account_service
+
+        try:
+            pooled_targets += [p["symbol"] for p in account_service.account_summary()["positions"]]
+        except Exception:  # noqa: BLE001
+            pass
+        pooled_targets = list(dict.fromkeys(pooled_targets))[:45]  # 去重+上限
+
+        seen_symbols: set[str] = set()
+        seen_pooled: set[str] = set()
+        for info in list_models():
+            name = info["name"]
+            parts = name.split("_")
+            symbol = parts[1] if len(parts) > 1 and len(parts[1]) == 6 and parts[1].isdigit() else ""
+            if symbol:
+                # 单标的模型（保留该标的最新一个）
+                if symbol in seen_symbols:
+                    continue
+                seen_symbols.add(symbol)
+                loaded = load_model_by_name(name)
+                if loaded is None:
+                    continue
+                lines += _predict_symbols(loaded[0], loaded[1], [symbol], name, lt)
+            else:
+                # 池化模型（取特征数最多的一个 = 最新增强版）
+                nf = len(info.get("features") or [])
+                if not nf or name in seen_pooled:
+                    continue
+                seen_pooled.add(name)
+                loaded = load_model_by_name(name)
+                if loaded is None:
+                    continue
+                lines += _predict_symbols(loaded[0], loaded[1], pooled_targets, name, lt)
+                break  # 只用一个池化模型（最新），避免重复输出
     except Exception as exc:  # noqa: BLE001
         logger.warning("ML 信号生成失败: %s", exc)
         return ""

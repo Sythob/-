@@ -153,6 +153,30 @@ function fmtPct(v: number | undefined): string {
 
 <template>
   <el-card shadow="never" class="index-card">
+    <el-tabs v-model="activeGroup">
+      <el-tab-pane v-for="g in indexGroups" :key="g.key" :label="g.name" :name="g.key">
+        <el-row :gutter="12">
+          <el-col v-for="idx in g.indices" :key="idx.symbol" :span="g.indices.length <= 3 ? 8 : 4">
+            <div class="stat-box">
+              <div class="stat-title">{{ idx.name }}</div>
+              <div class="stat-value" :class="(idx.pct_change || 0) >= 0 ? 'text-up' : 'text-down'">
+                {{ idx.last_price?.toFixed(2) }}
+              </div>
+              <div class="stat-sub" :class="(idx.pct_change || 0) >= 0 ? 'text-up' : 'text-down'">
+                <span v-if="idx.change !== undefined">{{ idx.change > 0 ? '+' : '' }}{{ idx.change?.toFixed(2) }}</span>
+                {{ fmtPct(idx.pct_change) }}
+                <span v-if="idx.trade_date" class="stat-date">（{{ idx.trade_date }}）</span>
+              </div>
+            </div>
+          </el-col>
+        </el-row>
+        <el-alert v-if="g.error" :title="`${g.name}指数获取失败：${g.error}`" type="warning" :closable="false" />
+        <p v-if="g.unavailable?.length" class="stat-note">暂不可用：{{ g.unavailable.join('、') }}（数据源已下线）</p>
+      </el-tab-pane>
+    </el-tabs>
+  </el-card>
+
+  <el-card shadow="never" class="index-card">
     <template #header>
       指数走势
       <el-radio-group
@@ -189,30 +213,6 @@ function fmtPct(v: number | undefined): string {
         :image-size="60"
       />
     </div>
-  </el-card>
-
-  <el-card shadow="never" class="index-card">
-    <el-tabs v-model="activeGroup">
-      <el-tab-pane v-for="g in indexGroups" :key="g.key" :label="g.name" :name="g.key">
-        <el-row :gutter="12">
-          <el-col v-for="idx in g.indices" :key="idx.symbol" :span="g.indices.length <= 3 ? 8 : 4">
-            <div class="stat-box">
-              <div class="stat-title">{{ idx.name }}</div>
-              <div class="stat-value" :class="(idx.pct_change || 0) >= 0 ? 'text-up' : 'text-down'">
-                {{ idx.last_price?.toFixed(2) }}
-              </div>
-              <div class="stat-sub" :class="(idx.pct_change || 0) >= 0 ? 'text-up' : 'text-down'">
-                <span v-if="idx.change !== undefined">{{ idx.change > 0 ? '+' : '' }}{{ idx.change?.toFixed(2) }}</span>
-                {{ fmtPct(idx.pct_change) }}
-                <span v-if="idx.trade_date" class="stat-date">（{{ idx.trade_date }}）</span>
-              </div>
-            </div>
-          </el-col>
-        </el-row>
-        <el-alert v-if="g.error" :title="`${g.name}指数获取失败：${g.error}`" type="warning" :closable="false" />
-        <p v-if="g.unavailable?.length" class="stat-note">暂不可用：{{ g.unavailable.join('、') }}（数据源已下线）</p>
-      </el-tab-pane>
-    </el-tabs>
   </el-card>
 
   <el-row :gutter="12" style="margin-top: 12px">
