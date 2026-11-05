@@ -146,28 +146,49 @@ def run_backtest(req: BacktestRequest):
 
 
 class AutoBacktestRequest(BaseModel):
+    symbols: list[str] = []  # 股票名称或 6 位代码；留空 = 自选池
     reset: bool = False
 
 
 @router.post("/backtest/auto")
 def run_auto(req: AutoBacktestRequest | None = None):
-    """智能批量回测：全部策略预设 × 自选池标的（约 2~5 分钟，后台运行）。
+    """智能批量回测：全部策略预设 × 指定标的（支持股票名称；约 2~5 分钟，后台运行）。
 
-    请求体可选：{\"reset\": true} 表示清空旧战绩重跑。
+    请求体可选：{\"symbols\": [\"茅台\", \"600519\"], \"reset\": true}；
+    symbols 留空 = 自选池，reset=true 清空旧战绩重跑。
     """
+    from app.api.paper import _resolve_symbol
     from app.engine.auto_backtest import run_auto_backtests
 
-    reset = req.reset if req else False
-    task_id = tasks.submit(run_auto_backtests, None, DEFAULT_START, "", 4, reset)
+    req = req or AutoBacktestRequest()
+    symbols = None
+    if req.symbols:
+        resolved = []
+        for sym in req.symbols:
+            try:
+                resolved.append(_resolve_symbol(sym))
+            except HTTPException as exc:
+                raise HTTPException(400, f"标的「{sym}」：{exc.detail}") from exc
+        symbols = list(dict.fromkeys(resolved))  # 去重保序
+    task_id = tasks.submit(run_auto_backtests, symbols, DEFAULT_START, "", 4, req.reset)
     return {"task_id": task_id}
 
 
 @router.get("/backtest/auto")
 def list_auto(order_by: str = "total_return", limit: int = 200):
-    """智能回测战绩表（策略×标的，含胜率/收益率）。"""
+    """智能回测战绩表（策略×标的，含胜率/收益率；标的附股票名称）。"""
+    from app.data.models import Instrument
     from app.engine.auto_backtest import list_auto_backtests
 
-    return list_auto_backtests(order_by=order_by, limit=limit)
+    rows = list_auto_backtests(order_by=order_by, limit=limit)
+    symbols = {r["symbol"] for r in rows if r["symbol"] != "组合"}
+    names = {
+        r.symbol: r.name
+        for r in database.get_session().query(Instrument).filter(Instrument.symbol.in_(symbols)).all()
+    }
+    for r in rows:
+        r["name"] = names.get(r["symbol"], "")
+    return rows
 
 
 @router.get("/backtest/runs")

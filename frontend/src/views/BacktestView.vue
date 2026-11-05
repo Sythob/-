@@ -42,6 +42,7 @@ const autoResults = ref<Record<string, any>[]>([])
 const autoRunning = ref(false)
 const autoStatus = ref('')
 const autoOrderBy = ref('total_return')
+const autoSymbols = ref('')  // 股票名称或代码，逗号分隔；留空 = 自选池
 let autoTimer: number | undefined
 
 async function loadAutoResults() {
@@ -53,10 +54,12 @@ async function loadAutoResults() {
 }
 
 async function runAutoBacktest() {
+  const symbols = autoSymbols.value.split(/[,，\s]+/).filter(Boolean)
+  const scope = symbols.length ? `${symbols.length} 只指定标的` : '自选池标的'
   autoRunning.value = true
-  autoStatus.value = '批量回测中：8 组策略 × 自选池标的（约 2~5 分钟）...'
+  autoStatus.value = `批量回测中：8 组策略 × ${scope}（约 2~5 分钟）...`
   try {
-    const resp = (await request.post('/backtest/auto')) as { task_id: string }
+    const resp = (await request.post('/backtest/auto', { symbols })) as { task_id: string }
     autoTimer = window.setInterval(async () => {
       try {
         const task = (await request.get(`/system/tasks/${resp.task_id}`)) as Record<string, any>
@@ -501,10 +504,23 @@ onMounted(loadStrategies)
             </el-button>
           </span>
         </template>
+        <div style="margin-bottom: 10px">
+          <el-input
+            v-model="autoSymbols"
+            size="small"
+            placeholder="指定标的：输入股票名称或代码，逗号分隔（如 茅台,600519），留空 = 全部自选池"
+            style="width: 100%"
+          />
+        </div>
         <div v-if="autoStatus" class="auto-status">{{ autoStatus }}</div>
         <el-table :data="autoResults" size="small" max-height="560" highlight-current-row @row-click="viewAutoDetail">
           <el-table-column prop="strategy_name" label="策略" width="130" />
-          <el-table-column prop="symbol" label="标的" width="90" />
+          <el-table-column label="标的" width="130">
+            <template #default="{ row }">
+              <span v-if="row.symbol === '组合'">组合</span>
+              <span v-else>{{ row.name || row.symbol }}<span class="form-tip">（{{ row.symbol }}）</span></span>
+            </template>
+          </el-table-column>
           <el-table-column label="胜率" width="80" sortable :sort-method="(a: any, b: any) => a.win_rate - b.win_rate">
             <template #default="{ row }">
               <span :class="row.win_rate >= 0.5 ? 'text-up' : 'text-down'">{{ (row.win_rate * 100).toFixed(1) }}%</span>
