@@ -38,7 +38,13 @@ GLOBAL_INDICES = [
     ("znb_N225", "日经225"), ("znb_FCHI", "法国CAC40"),
 ]
 
-TTL = {"a": 300, "hk": 300, "us": 600, "global": 600}
+# 商品与汇率（新浪 hf_/fx_ 接口）：富时A50期货、原油、黄金、铜、美元人民币
+FX_INDICES = [
+    ("hf_CHA50CFD", "富时A50期货"), ("hf_CL", "纽约原油"), ("hf_GC", "纽约黄金"),
+    ("hf_HG", "美铜"), ("fx_susdcny", "美元/人民币"),
+]
+
+TTL = {"a": 300, "hk": 300, "us": 600, "global": 600, "fx": 300}
 
 _cache: dict[str, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
@@ -191,6 +197,80 @@ def _fetch_global() -> dict:
     return parse_znb_text(resp.content.decode("gbk", errors="replace"), dict(GLOBAL_INDICES))
 
 
+def _parse_hf_line(code: str, fields: list[str], mapping: dict[str, str]) -> dict:
+    """hf_ 期货行解析。
+
+    格式: 最新价,_,买价,卖价,最高,最低,时间,昨结算,今开,...,日期,名称,...
+    涨跌幅 = (最新/昨结算 - 1) × 100。
+    """
+    try:
+        latest, settle = float(fields[0]), float(fields[7])
+    except (ValueError, IndexError):
+        return _group_result([], [mapping[code]])
+    if settle <= 0:
+        settle = latest
+    return _group_result([{
+        "symbol": code, "name": mapping[code],
+        "last_price": latest,
+        "pct_change": round((latest / settle - 1) * 100, 2),
+        "change": round(latest - settle, 3),
+        "trade_date": fields[12] if len(fields) > 12 else "",
+    }])
+
+
+def _parse_fx_line(code: str, fields: list[str], mapping: dict[str, str]) -> dict:
+    """fx_ 汇率行解析。
+
+    格式: 时间,买价,卖价,...,昨收,...,名称,...,日期
+    涨跌幅 = (买价/昨收 - 1) × 100。
+    """
+    try:
+        latest, prev = float(fields[1]), float(fields[5])
+    except (ValueError, IndexError):
+        return _group_result([], [mapping[code]])
+    if prev <= 0:
+        prev = latest
+    return _group_result([{
+        "symbol": code, "name": mapping[code],
+        "last_price": latest,
+        "pct_change": round((latest / prev - 1) * 100, 4),
+        "change": round(latest - prev, 4),
+        "trade_date": fields[-1] if len(fields) > 13 else "",
+    }])
+
+
+def _fetch_fx() -> dict:
+    """商品与汇率：新浪 hf_/fx_ 接口（单请求）。"""
+    url = "https://hq.sinajs.cn/list=" + ",".join(c for c, _ in FX_INDICES)
+    resp = requests.get(
+        url,
+        headers={"Referer": "https://finance.sina.com.cn",
+                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    text = resp.content.decode("gbk", errors="replace")
+    mapping = dict(FX_INDICES)
+    indices: list[dict] = []
+    unavailable: list[str] = []
+    for line in text.strip().splitlines():
+        if '="' not in line:
+            continue
+        code_part, payload = line.split('="', 1)
+        code = code_part.split("hq_str_")[-1].strip()
+        if code not in mapping:
+            continue
+        fields = payload.rstrip().rstrip(';').rstrip('"').split(",")
+        if not fields or not fields[0]:
+            unavailable.append(mapping[code])
+            continue
+        result = _parse_fx_line(code, fields, mapping) if code.startswith("fx_") \
+            else _parse_hf_line(code, fields, mapping)
+        indices.extend(result["indices"])
+        unavailable.extend(result["unavailable"])
+    return _group_result(indices, unavailable)
+
+
 # ---------------------------------------------------------------- 对外接口
 
 def get_grouped_indices() -> dict:
@@ -201,6 +281,7 @@ def get_grouped_indices() -> dict:
         ("hk", "港股", _fetch_hk),
         ("us", "美股", _fetch_us),
         ("global", "全球", _fetch_global),
+        ("fx", "商品汇率", _fetch_fx),
     ):
         try:
             result = _cached(key, TTL[key], fetcher)

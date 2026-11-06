@@ -225,6 +225,38 @@ def _build_ml_signals() -> str:
     return "\n".join(lines)
 
 
+def _build_global_brief() -> str:
+    """外围市场简报：隔夜美股/港股/全球指数/A50期货/汇率/大宗商品（带超时保护）。
+
+    数据源 = global_indices 多组缓存（首页同源）；失败时返回空串，不影响报告生成。
+    """
+    import concurrent.futures
+
+    def _fetch() -> str:
+        from app.data.global_indices import get_grouped_indices
+
+        data = get_grouped_indices()
+        lines: list[str] = []
+        for g in data["groups"]:
+            if g["key"] == "a":
+                continue  # A股已在本期行情数据中
+            for idx in g["indices"]:
+                pct = idx.get("pct_change")
+                pct_s = f"{pct:+.2f}%" if isinstance(pct, (int, float)) else "--"
+                date_s = f"（{idx['trade_date']}）" if idx.get("trade_date") else ""
+                lines.append(f"{idx['name']} {idx['last_price']:.2f} {pct_s}{date_s}")
+        if not lines:
+            return ""
+        return "\n".join(lines)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            return pool.submit(_fetch).result(timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("外围市场数据获取失败（跳过）: %s", exc)
+        return ""
+
+
 def _build_funds_brief() -> str:
     """资金面证据：北向资金 + 龙虎榜（网络调用带超时保护）。"""
     import concurrent.futures
@@ -280,24 +312,36 @@ def _build_notes_brief() -> str:
     return "\n".join(lines)
 
 
-def _build_news_brief(limit: int = 20) -> str:
-    """新闻摘要：只取最新交易日当天的新闻，绝不混入旧闻。"""
+def _build_news_brief(limit: int = 30) -> str:
+    """新闻摘要：只取最新交易日当天的新闻，绝不混入旧闻。
+
+    LLM 打分优先展示；未打分的用本地情绪模型方向标注（利好/利空/中性）。
+    """
     from app.data import calendar as calendar_module
+    from sqlalchemy import or_
 
     latest_trade = calendar_module.latest_trade_date()
     with database.get_session() as session:
         rows = (
             session.query(News)
-            .filter(News.sentiment_label.isnot(None), News.pub_time >= latest_trade)
+            .filter(or_(News.sentiment_label.isnot(None), News.finbert_score.isnot(None)),
+                    News.pub_time >= latest_trade)
             .order_by(News.pub_time.desc())
             .limit(limit).all()
         )
         symbols = {r.symbol for r in rows}
         names = _symbol_names(sorted(symbols))
-        return "\n".join(
-            f"- [{r.sentiment_label}] {r.symbol}（{names.get(r.symbol, '')}） {r.title}"
-            for r in rows
-        )
+
+    def _label(r) -> str:
+        if r.sentiment_label:
+            return r.sentiment_label
+        s = r.finbert_score or 0.0
+        return "利好" if s > 0.15 else ("利空" if s < -0.15 else "中性")
+
+    return "\n".join(
+        f"- [{_label(r)}] {r.symbol}（{names.get(r.symbol, '')}） {r.title}"
+        for r in rows
+    )
 
 
 def report_exists_for_date(report_date: str) -> bool:
@@ -702,12 +746,14 @@ async def generate_daily_report(provider=None, date: str | None = None) -> dict:
     cycle = ""
     ml_signals = ""
     funds = ""
+    global_markets = ""
     if date is None:
         from app.data.sentiment import sentiment_cycle_brief
 
         cycle = sentiment_cycle_brief()
         ml_signals = _build_ml_signals()
         funds = _build_funds_brief()
+        global_markets = _build_global_brief()
     prior_report = _load_prior_report()
     lessons = _load_lessons()
 
@@ -730,6 +776,7 @@ async def generate_daily_report(provider=None, date: str | None = None) -> dict:
             sentiment_cycle=cycle,
             ml_signals=ml_signals,
             funds=funds,
+            global_markets=global_markets,
         )},
     ], temperature=0.5)
 
